@@ -78,4 +78,4 @@ ENV NODE_ENV=production \
 EXPOSE 3100
 
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["sh", "-c", "pnpm paperclipai onboard --yes && pnpm paperclipai run"]
+CMD ["sh", "-c", "pnpm paperclipai onboard --yes && exec node --import ./server/node_modules/tsx/dist/loader.mjs server/dist/index.js"]
