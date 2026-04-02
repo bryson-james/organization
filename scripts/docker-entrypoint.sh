@@ -33,15 +33,4 @@ if [ ! -f "$CONFIG_PATH" ]; then
     gosu node pnpm paperclipai onboard --yes || true
 fi
 
-# Generate bootstrap CEO invite if in authenticated mode
-if [ "$PAPERCLIP_DEPLOYMENT_MODE" = "authenticated" ]; then
-    echo "Generating bootstrap CEO invite in background..."
-    (
-        sleep 10
-        gosu node pnpm paperclipai auth bootstrap-ceo \
-            --base-url "${PAPERCLIP_PUBLIC_URL:-${BETTER_AUTH_BASE_URL:-http://localhost:3100}}" \
-            || true
-    ) &
-fi
-
 exec gosu node "$@"
