@@ -78,4 +78,4 @@ ENV NODE_ENV=production \
 EXPOSE 3100
 
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["pnpm", "paperclipai", "run", "--yes"]
+CMD ["sh", "-c", "pnpm paperclipai onboard --yes && pnpm paperclipai run"]
