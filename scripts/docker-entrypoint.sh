@@ -22,9 +22,9 @@ if [ "$(id -g node)" -ne "$PGID" ]; then
     changed=1
 fi
 
-if [ "$changed" = "1" ]; then
-    chown -R node:node /paperclip
-fi
+# Always ensure /paperclip is writable by the node user
+# (Railway volumes mount as root-owned on first attach)
+chown -R node:node /paperclip
 
 # Auto-onboard if no config exists (non-interactive Docker deployment)
 CONFIG_PATH="${PAPERCLIP_CONFIG:-/paperclip/instances/default/config.json}"
