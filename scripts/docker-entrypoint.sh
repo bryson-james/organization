@@ -33,4 +33,13 @@ if [ ! -f "$CONFIG_PATH" ]; then
     gosu node pnpm paperclipai onboard --yes || true
 fi
 
+# Install Anthropic document-skills plugin once per volume.
+# Lives at /paperclip/.claude/plugins which is on organization-volume,
+# so this runs only on first boot per volume (or after a volume reset).
+if [ ! -d "/paperclip/.claude/plugins/document-skills" ]; then
+    echo "Installing document-skills plugin..."
+    gosu node claude /plugin marketplace add anthropics/skills || true
+    gosu node claude /plugin install document-skills@anthropic-agent-skills || true
+fi
+
 exec gosu node "$@"
