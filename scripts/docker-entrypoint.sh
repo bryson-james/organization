@@ -42,4 +42,15 @@ if [ ! -d "/paperclip/.claude/plugins/document-skills" ]; then
     gosu node claude /plugin install document-skills@anthropic-agent-skills || true
 fi
 
+# Register the Google Drive MCP server (stdio subprocess of claude).
+# Skipped if GOOGLE_SERVICE_ACCOUNT_JSON is not set, since the MCP can't auth without it.
+# Registration is at user scope so it persists in /paperclip/.claude across deploys.
+if [ -n "$GOOGLE_SERVICE_ACCOUNT_JSON" ] && [ -f /app/mcp-gdrive/main.py ]; then
+    if ! gosu node claude mcp get gdrive >/dev/null 2>&1; then
+        echo "Registering gdrive MCP..."
+        gosu node claude mcp add -s user gdrive -- \
+            /opt/mcp-gdrive-venv/bin/python /app/mcp-gdrive/main.py --transport stdio || true
+    fi
+fi
+
 exec gosu node "$@"

@@ -2,7 +2,7 @@ FROM node:lts-trixie-slim AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates gosu curl git wget ripgrep python3 pandoc \
+  && apt-get install -y --no-install-recommends ca-certificates gosu curl git wget ripgrep python3 python3-venv python3-pip pandoc \
   && mkdir -p -m 755 /etc/apt/keyrings \
   && wget -nv -O/etc/apt/keyrings/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg \
   && echo "6084d5d7bd8e288441e0e94fc6275570895da18e6751f70f057485dc2d1a811b  /etc/apt/keyrings/githubcli-archive-keyring.gpg" | sha256sum -c - \
@@ -57,6 +57,10 @@ COPY --chown=node:node --from=build /app /app
 RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
+
+# Build the Python venv for the gdrive MCP server (stdio subprocess of claude)
+RUN python3 -m venv /opt/mcp-gdrive-venv \
+  && /opt/mcp-gdrive-venv/bin/pip install --no-cache-dir -r /app/mcp-gdrive/requirements.txt
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
