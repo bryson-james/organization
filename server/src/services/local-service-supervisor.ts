@@ -184,7 +184,31 @@ export async function findLocalServiceRegistryRecordByRuntimeServiceId(input: {
   const records = await listLocalServiceRegistryRecords(
     input.profileKind ? { profileKind: input.profileKind } : undefined,
   );
-  return records.find((record) => record.runtimeServiceId === input.runtimeServiceId) ?? null;
+  const record = records.find((entry) => entry.runtimeServiceId === input.runtimeServiceId) ?? null;
+  if (!record) return null;
+
+  let candidate = record;
+  if (!isPidAlive(candidate.pid)) {
+    const ownerPid = candidate.port ? await readLocalServicePortOwner(candidate.port) : null;
+    if (!ownerPid) {
+      await removeLocalServiceRegistryRecord(candidate.serviceKey);
+      return null;
+    }
+    candidate = {
+      ...candidate,
+      pid: ownerPid,
+      processGroupId: candidate.processGroupId && isPidAlive(candidate.processGroupId) ? candidate.processGroupId : ownerPid,
+      lastSeenAt: new Date().toISOString(),
+    };
+    await writeLocalServiceRegistryRecord(candidate);
+  }
+
+  if (!(await isLikelyMatchingCommand(candidate))) {
+    await removeLocalServiceRegistryRecord(record.serviceKey);
+    return null;
+  }
+
+  return candidate;
 }
 
 export function isPidAlive(pid: number) {
@@ -197,13 +221,27 @@ export function isPidAlive(pid: number) {
   }
 }
 
+export function isProcessGroupAlive(processGroupId: number | null | undefined) {
+  if (process.platform === "win32") return false;
+  if (typeof processGroupId !== "number" || !Number.isInteger(processGroupId) || processGroupId <= 0) return false;
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function isLikelyMatchingCommand(record: LocalServiceRegistryRecord) {
   if (process.platform === "win32") return true;
   try {
     const { stdout } = await execFileAsync("ps", ["-o", "command=", "-p", String(record.pid)]);
     const commandLine = stdout.trim();
     if (!commandLine) return false;
-    return commandLine.includes(record.command) || commandLine.includes(record.serviceName);
+    const normalize = (value: string) => value.replace(/["']/g, "").replace(/\s+/g, " ").trim();
+    const normalizedCommandLine = normalize(commandLine);
+    const normalizedRecordedCommand = normalize(record.command);
+    return normalizedCommandLine.includes(normalizedRecordedCommand) || normalizedCommandLine.includes(record.serviceName);
   } catch {
     return true;
   }
@@ -211,12 +249,17 @@ async function isLikelyMatchingCommand(record: LocalServiceRegistryRecord) {
 
 export async function findAdoptableLocalService(input: {
   serviceKey: string;
+  profileKind?: string | null;
+  serviceName?: string | null;
   command?: string | null;
   cwd?: string | null;
   envFingerprint?: string | null;
   port?: number | null;
+  url?: string | null;
 }) {
-  const record = await readLocalServiceRegistryRecord(input.serviceKey);
+  const record =
+    await readLocalServiceRegistryRecord(input.serviceKey)
+    ?? await adoptLocalServiceFromPortOwner(input);
   if (!record) return null;
 
   if (!isPidAlive(record.pid)) {
@@ -231,6 +274,59 @@ export async function findAdoptableLocalService(input: {
   if (input.cwd && path.resolve(record.cwd) !== path.resolve(input.cwd)) return null;
   if (input.envFingerprint && record.envFingerprint !== input.envFingerprint) return null;
   if (input.port !== undefined && input.port !== null && record.port !== input.port) return null;
+  return record;
+}
+
+async function readProcessGroupId(pid: number) {
+  if (process.platform === "win32") return null;
+  try {
+    const { stdout } = await execFileAsync("ps", ["-o", "pgid=", "-p", String(pid)]);
+    const parsed = Number.parseInt(stdout.trim(), 10);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function adoptLocalServiceFromPortOwner(input: {
+  serviceKey: string;
+  profileKind?: string | null;
+  serviceName?: string | null;
+  command?: string | null;
+  cwd?: string | null;
+  envFingerprint?: string | null;
+  port?: number | null;
+  url?: string | null;
+}) {
+  if (!input.port) return null;
+  const ownerPid = await readLocalServicePortOwner(input.port);
+  if (!ownerPid) return null;
+
+  const processGroupId = await readProcessGroupId(ownerPid);
+  const pid = processGroupId && isPidAlive(processGroupId) ? processGroupId : ownerPid;
+  const now = new Date().toISOString();
+  const record: LocalServiceRegistryRecord = {
+    version: 1,
+    serviceKey: input.serviceKey,
+    profileKind: input.profileKind ?? "workspace-runtime",
+    serviceName: input.serviceName ?? "service",
+    command: input.command ?? input.serviceName ?? "service",
+    cwd: input.cwd ?? process.cwd(),
+    envFingerprint: input.envFingerprint ?? "",
+    port: input.port,
+    url: input.url ?? null,
+    pid,
+    processGroupId: processGroupId ?? pid,
+    provider: "local_process",
+    runtimeServiceId: null,
+    reuseKey: input.envFingerprint ?? null,
+    startedAt: now,
+    lastSeenAt: now,
+    metadata: null,
+  };
+
+  if (!(await isLikelyMatchingCommand(record))) return null;
+  await writeLocalServiceRegistryRecord(record);
   return record;
 }
 
@@ -269,13 +365,19 @@ export async function terminateLocalService(
 
   const deadline = Date.now() + (opts?.forceAfterMs ?? 2_000);
   while (Date.now() < deadline) {
-    if (!isPidAlive(record.pid)) {
+    const targetAlive = targetProcessGroup
+      ? isProcessGroupAlive(record.processGroupId)
+      : isPidAlive(record.pid);
+    if (!targetAlive) {
       return;
     }
     await delay(100);
   }
 
-  if (!isPidAlive(record.pid)) return;
+  const stillAlive = targetProcessGroup
+    ? isProcessGroupAlive(record.processGroupId)
+    : isPidAlive(record.pid);
+  if (!stillAlive) return;
   try {
     if (targetProcessGroup) {
       process.kill(-record.processGroupId!, "SIGKILL");
@@ -290,7 +392,7 @@ export async function terminateLocalService(
 export async function readLocalServicePortOwner(port: number) {
   if (!Number.isInteger(port) || port <= 0 || process.platform === "win32") return null;
   try {
-    const { stdout } = await execFileAsync("lsof", ["-nPiTCP", `:${port}`, "-sTCP:LISTEN", "-t"]);
+    const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
     const firstPid = stdout
       .split("\n")
       .map((line) => Number.parseInt(line.trim(), 10))

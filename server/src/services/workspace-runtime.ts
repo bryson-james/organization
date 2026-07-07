@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
 import { createHash, randomUUID } from "node:crypto";
@@ -7,6 +8,13 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
+import {
+  listWorkspaceServiceCommandDefinitions,
+  type GitWorktreeBranchAncestryVerdict,
+  type GitWorktreeBranchIncoherenceEvidence as SharedGitWorktreeBranchIncoherenceEvidence,
+  type WorkspaceRuntimeDesiredState,
+  type WorkspaceRuntimeServiceStateMap,
+} from "@paperclipai/shared";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { resolveHomeAwarePath } from "../home-paths.js";
@@ -24,6 +32,14 @@ import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { readExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 
+export function resolveShell(): string {
+  const fallback = process.platform === "win32" ? "sh" : "/bin/sh";
+  const shell = process.env.SHELL?.trim();
+  if (!shell) return fallback;
+  if (path.isAbsolute(shell) && !existsSync(shell)) return fallback;
+  return shell;
+}
+
 export interface ExecutionWorkspaceInput {
   baseCwd: string;
   source: "project_primary" | "task_session" | "agent_home";
@@ -37,6 +53,7 @@ export interface ExecutionWorkspaceIssueRef {
   id: string;
   identifier: string | null;
   title: string | null;
+  workMode?: string | null;
 }
 
 export interface ExecutionWorkspaceAgentRef {
@@ -52,6 +69,18 @@ export interface RealizedExecutionWorkspace extends ExecutionWorkspaceInput {
   worktreePath: string | null;
   warnings: string[];
   created: boolean;
+  baseRefSha?: string | null;
+}
+
+export class WorkspaceRuntimeValidationFailure extends Error {
+  code = "workspace_validation_failed" as const;
+  resultJson: Record<string, unknown>;
+
+  constructor(message: string, resultJson: Record<string, unknown>) {
+    super(message);
+    this.name = "WorkspaceRuntimeValidationFailure";
+    this.resultJson = resultJson;
+  }
 }
 
 export interface RuntimeServiceRef {
@@ -94,9 +123,26 @@ interface RuntimeServiceRecord extends RuntimeServiceRef {
   processGroupId: number | null;
 }
 
+type StoppedRuntimeServiceReuseCandidate = {
+  id: string;
+  port: number | null;
+};
+
 const runtimeServicesById = new Map<string, RuntimeServiceRecord>();
 const runtimeServicesByReuseKey = new Map<string, string>();
 const runtimeServiceLeasesByRun = new Map<string, string[]>();
+const DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES = 256 * 1024;
+
+type ProcessOutputCapture = {
+  text: string;
+  truncated: boolean;
+  totalBytes: number;
+};
+
+type ProcessOutputAccumulator = {
+  append(chunk: string): void;
+  finish(): ProcessOutputCapture;
+};
 
 export async function resetRuntimeServicesForTests() {
   for (const record of runtimeServicesById.values()) {
@@ -116,6 +162,139 @@ function stableStringify(value: unknown): string {
     return `{${Object.keys(rec).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(rec[key])}`).join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+type WorkspaceLinkMismatch = {
+  packageName: string;
+  expectedPath: string;
+  actualPath: string | null;
+};
+
+function readJsonFile(filePath: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+}
+
+function findWorkspaceRoot(startCwd: string) {
+  let current = path.resolve(startCwd);
+  while (true) {
+    if (existsSync(path.join(current, "pnpm-workspace.yaml"))) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+function isLinkedGitWorktreeCheckout(rootDir: string) {
+  const gitMetadataPath = path.join(rootDir, ".git");
+  if (!existsSync(gitMetadataPath)) return false;
+
+  const stat = lstatSync(gitMetadataPath);
+  if (!stat.isFile()) return false;
+
+  return readFileSync(gitMetadataPath, "utf8").trimStart().startsWith("gitdir:");
+}
+
+function discoverWorkspacePackagePaths(rootDir: string): Map<string, string> {
+  const packagePaths = new Map<string, string>();
+  const ignoredDirNames = new Set([".git", ".paperclip", "dist", "node_modules"]);
+
+  function visit(dirPath: string) {
+    if (!existsSync(dirPath)) return;
+
+    const packageJsonPath = path.join(dirPath, "package.json");
+    if (existsSync(packageJsonPath)) {
+      const packageJson = readJsonFile(packageJsonPath);
+      if (typeof packageJson.name === "string" && packageJson.name.length > 0) {
+        packagePaths.set(packageJson.name, dirPath);
+      }
+    }
+
+    for (const entry of readdirSync(dirPath, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (ignoredDirNames.has(entry.name)) continue;
+      visit(path.join(dirPath, entry.name));
+    }
+  }
+
+  visit(path.join(rootDir, "packages"));
+  visit(path.join(rootDir, "server"));
+  visit(path.join(rootDir, "ui"));
+  visit(path.join(rootDir, "cli"));
+
+  return packagePaths;
+}
+
+function findServerWorkspaceLinkMismatches(rootDir: string): WorkspaceLinkMismatch[] {
+  const serverPackageJsonPath = path.join(rootDir, "server", "package.json");
+  if (!existsSync(serverPackageJsonPath)) return [];
+
+  const serverPackageJson = readJsonFile(serverPackageJsonPath);
+  const dependencies = {
+    ...(serverPackageJson.dependencies as Record<string, unknown> | undefined),
+    ...(serverPackageJson.devDependencies as Record<string, unknown> | undefined),
+  };
+  const workspacePackagePaths = discoverWorkspacePackagePaths(rootDir);
+  const mismatches: WorkspaceLinkMismatch[] = [];
+
+  for (const [packageName, version] of Object.entries(dependencies)) {
+    if (typeof version !== "string" || !version.startsWith("workspace:")) continue;
+
+    const expectedPath = workspacePackagePaths.get(packageName);
+    if (!expectedPath) continue;
+    const normalizedExpectedPath = existsSync(expectedPath) ? path.resolve(realpathSync(expectedPath)) : path.resolve(expectedPath);
+
+    const linkPath = path.join(rootDir, "server", "node_modules", ...packageName.split("/"));
+    const actualPath = existsSync(linkPath) ? path.resolve(realpathSync(linkPath)) : null;
+    if (actualPath === normalizedExpectedPath) continue;
+
+    mismatches.push({
+      packageName,
+      expectedPath: normalizedExpectedPath,
+      actualPath,
+    });
+  }
+
+  return mismatches;
+}
+
+export async function ensureServerWorkspaceLinksCurrent(
+  startCwd: string,
+  opts?: {
+    onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  },
+) {
+  const workspaceRoot = findWorkspaceRoot(startCwd);
+  if (!workspaceRoot) return;
+  if (!isLinkedGitWorktreeCheckout(workspaceRoot)) return;
+
+  const mismatches = findServerWorkspaceLinkMismatches(workspaceRoot);
+  if (mismatches.length === 0) return;
+
+  if (opts?.onLog) {
+    await opts.onLog("stdout", "[runtime] detected stale workspace package links for server; relinking dependencies...\n");
+    for (const mismatch of mismatches) {
+      await opts.onLog(
+        "stdout",
+        `[runtime]   ${mismatch.packageName}: ${mismatch.actualPath ?? "missing"} -> ${mismatch.expectedPath}\n`,
+      );
+    }
+  }
+
+  for (const mismatch of mismatches) {
+    const linkPath = path.join(workspaceRoot, "server", "node_modules", ...mismatch.packageName.split("/"));
+    await fs.mkdir(path.dirname(linkPath), { recursive: true });
+    await fs.rm(linkPath, { recursive: true, force: true });
+    await fs.symlink(mismatch.expectedPath, linkPath);
+  }
+
+  const remainingMismatches = findServerWorkspaceLinkMismatches(workspaceRoot);
+  if (remainingMismatches.length === 0) return;
+
+  throw new Error(
+    `Workspace relink did not repair all server package links: ${remainingMismatches.map((item) => item.packageName).join(", ")}`,
+  );
 }
 
 export function sanitizeRuntimeServiceBaseEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -254,30 +433,97 @@ function formatCommandForDisplay(command: string, args: string[]) {
     .join(" ");
 }
 
+function trimToLastBytes(value: string, limit: number) {
+  const byteLength = Buffer.byteLength(value, "utf8");
+  if (byteLength <= limit) return value;
+  return Buffer.from(value, "utf8").subarray(byteLength - limit).toString("utf8");
+}
+
+function createProcessOutputCapture(maxBytes: number): ProcessOutputAccumulator {
+  const limit = Math.max(1, Math.trunc(maxBytes));
+  let text = "";
+  let truncated = false;
+  let totalBytes = 0;
+
+  return {
+    append(chunk: string) {
+      if (!chunk) return;
+      totalBytes += Buffer.byteLength(chunk, "utf8");
+
+      const combined = text + chunk;
+      if (Buffer.byteLength(combined, "utf8") <= limit) {
+        text = combined;
+        return;
+      }
+
+      text = trimToLastBytes(combined, limit);
+      truncated = true;
+    },
+    finish(): ProcessOutputCapture {
+      if (!truncated) {
+        return {
+          text,
+          truncated: false,
+          totalBytes,
+        };
+      }
+      return {
+        text: `[output truncated to last ${limit} bytes; total ${totalBytes} bytes]\n${text}`,
+        truncated: true,
+        totalBytes,
+      };
+    },
+  };
+}
+
 async function executeProcess(input: {
   command: string;
   args: string[];
   cwd: string;
   env?: NodeJS.ProcessEnv;
-}): Promise<{ stdout: string; stderr: string; code: number | null }> {
-  const proc = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve, reject) => {
+  maxStdoutBytes?: number;
+  maxStderrBytes?: number;
+}): Promise<{
+  stdout: string;
+  stderr: string;
+  code: number | null;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+  stdoutBytes: number;
+  stderrBytes: number;
+}> {
+  const proc = await new Promise<{
+    stdout: ProcessOutputAccumulator;
+    stderr: ProcessOutputAccumulator;
+    code: number | null;
+  }>((resolve, reject) => {
     const child = spawn(input.command, input.args, {
       cwd: input.cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: input.env ?? process.env,
     });
-    let stdout = "";
-    let stderr = "";
+    const stdout = createProcessOutputCapture(input.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
+    const stderr = createProcessOutputCapture(input.maxStderrBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
     child.stdout?.on("data", (chunk) => {
-      stdout += String(chunk);
+      stdout.append(String(chunk));
     });
     child.stderr?.on("data", (chunk) => {
-      stderr += String(chunk);
+      stderr.append(String(chunk));
     });
     child.on("error", reject);
     child.on("close", (code) => resolve({ stdout, stderr, code }));
   });
-  return proc;
+  const stdout = proc.stdout.finish();
+  const stderr = proc.stderr.finish();
+  return {
+    stdout: stdout.text,
+    stderr: stderr.text,
+    code: proc.code,
+    stdoutTruncated: stdout.truncated,
+    stderrTruncated: stderr.truncated,
+    stdoutBytes: stdout.totalBytes,
+    stderrBytes: stderr.totalBytes,
+  };
 }
 
 async function runGit(args: string[], cwd: string): Promise<string> {
@@ -292,13 +538,753 @@ async function runGit(args: string[], cwd: string): Promise<string> {
   return proc.stdout.trim();
 }
 
+function formatShortSha(value: string | null | undefined) {
+  return value ? value.slice(0, 12) : "unknown";
+}
+
 function gitErrorIncludes(error: unknown, needle: string) {
   const message = error instanceof Error ? error.message : String(error);
   return message.toLowerCase().includes(needle.toLowerCase());
 }
 
+function parseRemoteTrackingRef(ref: string): { remote: string; branch: string } | null {
+  const trimmed = ref.trim();
+  const refsRemotesPrefix = "refs/remotes/";
+  const normalized = trimmed.startsWith(refsRemotesPrefix)
+    ? trimmed.slice(refsRemotesPrefix.length)
+    : trimmed;
+  const slashIndex = normalized.indexOf("/");
+  if (slashIndex <= 0 || slashIndex === normalized.length - 1) return null;
+  const remote = normalized.slice(0, slashIndex);
+  const branch = normalized.slice(slashIndex + 1);
+  if (!/^[A-Za-z0-9._-]+$/.test(remote)) return null;
+  return { remote, branch };
+}
+
+async function refreshRemoteTrackingBaseRef(repoRoot: string, baseRef: string): Promise<string[]> {
+  const remoteTracking = parseRemoteTrackingRef(baseRef);
+  if (!remoteTracking) return [];
+
+  const remoteExists = await runGit(["remote", "get-url", remoteTracking.remote], repoRoot)
+    .then(() => true)
+    .catch(() => false);
+  if (!remoteExists) return [];
+
+  try {
+    await runGit([
+      "fetch",
+      "--prune",
+      remoteTracking.remote,
+      `+refs/heads/${remoteTracking.branch}:refs/remotes/${remoteTracking.remote}/${remoteTracking.branch}`,
+    ], repoRoot);
+    return [];
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return [`Could not refresh base ref ${baseRef} before preparing the execution workspace: ${message}`];
+  }
+}
+
+async function resolveBaseRefSha(repoRoot: string, baseRef: string): Promise<string | null> {
+  return await runGit(["rev-parse", "--verify", `${baseRef}^{commit}`], repoRoot).catch(() => null);
+}
+
+function readRecordedBaseRefSha(metadata: Record<string, unknown> | null | undefined): string | null {
+  const snapshot = parseObject(metadata?.baseRefSnapshot);
+  const resolvedSha = snapshot.resolvedSha;
+  return typeof resolvedSha === "string" && resolvedSha.trim().length > 0 ? resolvedSha.trim() : null;
+}
+
+export async function inspectExecutionWorkspaceBaseDrift(input: {
+  repoRoot: string;
+  worktreePath: string;
+  branchName: string | null;
+  baseRef: string | null;
+  recordedBaseRefSha?: string | null;
+  skipRefresh?: boolean;
+}): Promise<{
+  warnings: string[];
+  currentBaseRefSha: string | null;
+  branchBaseRefSha: string | null;
+}> {
+  const baseRef = input.baseRef?.trim();
+  if (!baseRef) {
+    return { warnings: [], currentBaseRefSha: null, branchBaseRefSha: null };
+  }
+
+  const warnings = input.skipRefresh ? [] : await refreshRemoteTrackingBaseRef(input.repoRoot, baseRef);
+  const currentBaseRefSha = await resolveBaseRefSha(input.repoRoot, baseRef);
+  if (!currentBaseRefSha) {
+    warnings.push(`Could not resolve base ref ${baseRef} while checking execution workspace freshness.`);
+    return { warnings, currentBaseRefSha: null, branchBaseRefSha: null };
+  }
+
+  const branchBaseRefSha = await runGit(["merge-base", "HEAD", baseRef], input.worktreePath).catch(() => null);
+  if (!branchBaseRefSha) {
+    warnings.push(`Could not compare execution workspace ${input.branchName ?? "branch"} against base ref ${baseRef}.`);
+    return { warnings, currentBaseRefSha, branchBaseRefSha: null };
+  }
+
+  if (branchBaseRefSha !== currentBaseRefSha) {
+    const behindCountRaw = await runGit(["rev-list", "--count", `HEAD..${baseRef}`], input.worktreePath).catch(() => "");
+    const behindCount = Number.parseInt(behindCountRaw, 10);
+    const behindText = Number.isFinite(behindCount) && behindCount > 0
+      ? `${behindCount} commit${behindCount === 1 ? "" : "s"}`
+      : "newer commits";
+    const recordedText = input.recordedBaseRefSha
+      ? `recorded base ${formatShortSha(input.recordedBaseRefSha)}`
+      : `merge-base ${formatShortSha(branchBaseRefSha)}`;
+    warnings.push(
+      `Execution workspace branch ${input.branchName ? `"${input.branchName}"` : "HEAD"} is behind ${baseRef} by ${behindText}: ${recordedText}, current base ${formatShortSha(currentBaseRefSha)}. Refresh or rebase the workspace before relying on recent base-branch fixes.`,
+    );
+  }
+
+  return { warnings, currentBaseRefSha, branchBaseRefSha };
+}
+
+async function localBranchExists(repoRoot: string, branch: string): Promise<boolean> {
+  return runGit(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], repoRoot)
+    .then(() => true)
+    .catch(() => false);
+}
+
+async function remoteExists(repoRoot: string, remote: string): Promise<boolean> {
+  return runGit(["remote", "get-url", remote], repoRoot)
+    .then(() => true)
+    .catch(() => false);
+}
+
+const GIT_WORKTREE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
+
+type GitWorktreeCleanliness = SharedGitWorktreeBranchIncoherenceEvidence["cleanliness"];
+
+type GitWorktreeBranchIncoherenceEvidence = SharedGitWorktreeBranchIncoherenceEvidence;
+
+function formatBranchForMessage(branch: string | null | undefined) {
+  return branch && branch.length > 0 ? branch : "<detached>";
+}
+
+function fingerprintWorkspaceBranchIncoherence(input: {
+  sourceIssueId: string | null;
+  executionWorkspaceId: string | null;
+  worktreePath: string;
+  expectedBranch: string;
+  actualBranch: string | null;
+  cleanliness: GitWorktreeCleanliness;
+  expectedHeadSha: string | null;
+  actualHeadSha: string | null;
+}) {
+  const digest = createHash("sha256")
+    .update(stableStringify({
+      version: 1,
+      reason: GIT_WORKTREE_BRANCH_INCOHERENCE_REASON,
+      sourceIssueId: input.sourceIssueId,
+      executionWorkspaceId: input.executionWorkspaceId,
+      worktreePath: path.resolve(input.worktreePath),
+      expectedBranch: input.expectedBranch,
+      actualBranch: input.actualBranch,
+      cleanliness: input.cleanliness,
+      expectedHeadSha: input.expectedHeadSha,
+      actualHeadSha: input.actualHeadSha,
+    }))
+    .digest("hex");
+  return `workspace_incoherence:v1:sha256:${digest}`;
+}
+
+async function getGitWorktreeBranchAncestryVerdict(input: {
+  repoRoot: string;
+  expectedHeadSha: string | null;
+  actualHeadSha: string | null;
+}): Promise<GitWorktreeBranchAncestryVerdict> {
+  if (!input.expectedHeadSha || !input.actualHeadSha) return "unknown";
+
+  const proc = await executeProcess({
+    command: "git",
+    args: ["merge-base", "--is-ancestor", input.expectedHeadSha, input.actualHeadSha],
+    cwd: input.repoRoot,
+  }).catch(() => null);
+  if (!proc) return "unknown";
+  if (proc.code === 0) return "ancestor";
+  if (proc.code === 1) return "diverged";
+  return "unknown";
+}
+
+function explainGitWorktreeBranchIncoherence(input: {
+  expectedBranchName: string;
+  actualBranchName: string | null;
+  expectedHeadSha: string | null;
+  actualHeadSha: string | null;
+  sameHead: boolean;
+  ancestryVerdict: GitWorktreeBranchAncestryVerdict;
+}) {
+  const actualBranch = formatBranchForMessage(input.actualBranchName);
+  if (!input.expectedHeadSha || !input.actualHeadSha) {
+    return `Paperclip could not determine branch ancestry because the recorded branch "${input.expectedBranchName}" or checked-out branch "${actualBranch}" is missing a resolvable HEAD commit.`;
+  }
+  if (input.sameHead) {
+    return `The recorded branch "${input.expectedBranchName}" and checked-out branch "${actualBranch}" resolve to the same commit, so the mismatch is branch metadata rather than commit divergence.`;
+  }
+  if (input.ancestryVerdict === "ancestor") {
+    return `The recorded branch "${input.expectedBranchName}" is an ancestor of the checked-out branch "${actualBranch}", so the checked-out branch is forward of the recorded branch.`;
+  }
+  if (input.ancestryVerdict === "diverged") {
+    return `The recorded branch "${input.expectedBranchName}" is not an ancestor of the checked-out branch "${actualBranch}", so Paperclip cannot prove a forward-only reconciliation.`;
+  }
+  return `Paperclip could not determine whether the checked-out branch "${actualBranch}" is forward of the recorded branch "${input.expectedBranchName}".`;
+}
+
+async function inspectGitWorktreeBranchIncoherence(input: {
+  repoRoot: string;
+  worktreePath: string;
+  expectedBranchName: string;
+  actualBranchName: string | null;
+  sourceIssue: ExecutionWorkspaceIssueRef | null;
+  executionWorkspaceId?: string | null;
+}): Promise<GitWorktreeBranchIncoherenceEvidence> {
+  const status = await runGit(
+    ["status", "--porcelain", "--untracked-files=all"],
+    input.worktreePath,
+  ).catch(() => null);
+  const statusLines = status === null
+    ? null
+    : status.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const cleanliness: GitWorktreeCleanliness =
+    status === null ? "unknown" : status.trim().length > 0 ? "dirty" : "clean";
+  const expectedHeadSha = await runGit(
+    ["rev-parse", "--verify", `refs/heads/${input.expectedBranchName}^{commit}`],
+    input.repoRoot,
+  ).catch(() => null);
+  const actualHeadSha = await runGit(["rev-parse", "HEAD"], input.worktreePath).catch(() => null);
+  const actualBranchExists = input.actualBranchName
+    ? await localBranchExists(input.repoRoot, input.actualBranchName)
+    : null;
+  const registered = await findRegisteredGitWorktreeByPath(input.repoRoot, input.worktreePath);
+  const actualBranchRef = input.actualBranchName ? `refs/heads/${input.actualBranchName}` : null;
+  const registeredBranchRef = registered?.branch ?? null;
+  const registeredBranchMatchesHead = Boolean(registered && registeredBranchRef === actualBranchRef);
+  const sameHead = Boolean(expectedHeadSha && actualHeadSha && expectedHeadSha === actualHeadSha);
+  const expectedBranchExists = Boolean(expectedHeadSha);
+  const ancestryVerdict = await getGitWorktreeBranchAncestryVerdict({
+    repoRoot: input.repoRoot,
+    expectedHeadSha,
+    actualHeadSha,
+  });
+  const plainLanguageReason = explainGitWorktreeBranchIncoherence({
+    expectedBranchName: input.expectedBranchName,
+    actualBranchName: input.actualBranchName,
+    expectedHeadSha,
+    actualHeadSha,
+    sameHead,
+    ancestryVerdict,
+  });
+  const eligible = cleanliness === "clean" && expectedBranchExists && sameHead && registeredBranchMatchesHead;
+  const safeRepairReason = eligible
+    ? "clean worktree and expected branch points at the current HEAD"
+    : cleanliness !== "clean"
+      ? "worktree is not clean"
+      : !registered
+        ? "worktree path is not registered"
+      : !registeredBranchMatchesHead
+        ? "registered worktree branch does not match HEAD"
+      : !expectedBranchExists
+        ? "expected branch does not exist"
+        : !sameHead
+          ? "expected branch and current HEAD differ"
+          : "safe repair could not be proven";
+  const fingerprint = fingerprintWorkspaceBranchIncoherence({
+    sourceIssueId: input.sourceIssue?.id ?? null,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+    worktreePath: input.worktreePath,
+    expectedBranch: input.expectedBranchName,
+    actualBranch: input.actualBranchName,
+    cleanliness,
+    expectedHeadSha,
+    actualHeadSha,
+  });
+
+  return {
+    reason: GIT_WORKTREE_BRANCH_INCOHERENCE_REASON,
+    fingerprint,
+    sourceIssueId: input.sourceIssue?.id ?? null,
+    sourceIdentifier: input.sourceIssue?.identifier ?? null,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+    worktreePath: path.resolve(input.worktreePath),
+    repoRoot: path.resolve(input.repoRoot),
+    expectedBranch: input.expectedBranchName,
+    actualBranch: input.actualBranchName,
+    cleanliness,
+    statusEntryCount: statusLines?.length ?? null,
+    provenance: {
+      expectedBranchRef: `refs/heads/${input.expectedBranchName}`,
+      actualBranchRef,
+      registeredBranchRef,
+      registeredPathFound: Boolean(registered),
+      registeredBranchMatchesHead,
+      expectedBranchExists,
+      actualBranchExists,
+      expectedHeadSha,
+      actualHeadSha,
+      sameHead,
+      ancestryVerdict,
+      plainLanguageReason,
+    },
+    safeRepair: {
+      eligible,
+      attempted: false,
+      succeeded: false,
+      reason: safeRepairReason,
+    },
+  };
+}
+
+function branchIncoherenceValidationFailure(evidence: GitWorktreeBranchIncoherenceEvidence) {
+  return new WorkspaceRuntimeValidationFailure(
+    `Execution workspace git worktree expected branch "${evidence.expectedBranch}" but found "${formatBranchForMessage(evidence.actualBranch)}" at "${evidence.worktreePath}". Safe repair ${evidence.safeRepair.succeeded ? "succeeded" : "was not completed"}: ${evidence.safeRepair.reason}.`,
+    {
+      workspaceValidation: evidence,
+    },
+  );
+}
+
+export async function ensureGitWorktreeBranchCoherent(input: {
+  repoRoot: string;
+  worktreePath: string;
+  expectedBranchName: string | null;
+  sourceIssue: ExecutionWorkspaceIssueRef | null;
+  executionWorkspaceId?: string | null;
+  actualBranchName?: string | null;
+  recorder?: WorkspaceOperationRecorder | null;
+}) {
+  const expectedBranchName = input.expectedBranchName?.trim();
+  if (!expectedBranchName) return;
+
+  const currentBranch = input.actualBranchName !== undefined
+    ? input.actualBranchName
+    : await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], input.worktreePath).catch(() => null);
+  if (currentBranch === expectedBranchName) return;
+
+  const evidence = await inspectGitWorktreeBranchIncoherence({
+    repoRoot: input.repoRoot,
+    worktreePath: input.worktreePath,
+    expectedBranchName,
+    actualBranchName: currentBranch,
+    sourceIssue: input.sourceIssue,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+  });
+
+  if (!evidence.safeRepair.eligible) {
+    throw branchIncoherenceValidationFailure(evidence);
+  }
+
+  evidence.safeRepair.attempted = true;
+  try {
+    await recordGitOperation(input.recorder, {
+      phase: "worktree_prepare",
+      args: ["checkout", expectedBranchName],
+      cwd: input.worktreePath,
+      metadata: {
+        repoRoot: input.repoRoot,
+        worktreePath: input.worktreePath,
+        expectedBranchName,
+        actualBranchName: currentBranch,
+        branchIncoherenceRepair: true,
+        fingerprint: evidence.fingerprint,
+        sourceIssueId: evidence.sourceIssueId,
+        executionWorkspaceId: evidence.executionWorkspaceId,
+      },
+      successMessage: `Repaired clean git worktree branch mismatch at ${input.worktreePath}: checked out ${expectedBranchName}\n`,
+      failureLabel: `git checkout ${expectedBranchName}`,
+    });
+  } catch (error) {
+    evidence.safeRepair.succeeded = false;
+    evidence.safeRepair.reason = `safe checkout failed: ${error instanceof Error ? error.message : String(error)}`;
+    throw branchIncoherenceValidationFailure(evidence);
+  }
+
+  const repairedBranch = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], input.worktreePath)
+    .catch(() => null);
+  if (repairedBranch !== expectedBranchName) {
+    evidence.safeRepair.succeeded = false;
+    evidence.safeRepair.reason = `checkout completed but HEAD is ${formatBranchForMessage(repairedBranch)}`;
+    throw branchIncoherenceValidationFailure(evidence);
+  }
+
+  evidence.safeRepair.succeeded = true;
+  evidence.safeRepair.reason = "clean worktree checked out the recorded branch";
+}
+
+// Resolve the authoritative base ref for a fresh worktree. A configured local
+// branch is mapped to its `origin/<branch>` counterpart so unpushed local
+// divergence never leaks into the task branch; remote-tracking refs, SHAs, and
+// tags are used verbatim, and an unset/`HEAD` base falls back to the detected
+// default branch (which already prefers `origin/master`).
+async function resolveAuthoritativeBaseRef(
+  repoRoot: string,
+  configuredBaseRef: string | null,
+): Promise<{ baseRef: string; warnings: string[]; refreshed: boolean }> {
+  const warnings: string[] = [];
+  const detectOrHead = async () => (await detectDefaultBranch(repoRoot)) ?? "HEAD";
+
+  const configured = configuredBaseRef?.trim();
+  if (!configured || configured === "HEAD") {
+    return { baseRef: await detectOrHead(), warnings, refreshed: false };
+  }
+
+  if (parseRemoteTrackingRef(configured)) {
+    return { baseRef: configured, warnings, refreshed: false };
+  }
+
+  if (await localBranchExists(repoRoot, configured)) {
+    const remoteCandidate = `origin/${configured}`;
+    // Refresh here and keep the warnings; the caller skips its own refresh of
+    // the returned ref (see `refreshed`) so we never fetch the same ref twice.
+    warnings.push(...await refreshRemoteTrackingBaseRef(repoRoot, remoteCandidate));
+    if (await resolveBaseRefSha(repoRoot, remoteCandidate)) {
+      return { baseRef: remoteCandidate, warnings, refreshed: true };
+    }
+    if (await remoteExists(repoRoot, "origin")) {
+      warnings.push(
+        `Configured base ref "${configured}" is a local branch with no matching origin/${configured}; basing the execution workspace on the local ref, which may include unpushed commits.`,
+      );
+    }
+    return { baseRef: configured, warnings, refreshed: false };
+  }
+
+  return { baseRef: configured, warnings, refreshed: false };
+}
+
+// Auto-refresh a reused worktree to the latest base only when it is provably
+// unstarted: no task commits past the base and a clean tree (including untracked
+// files). This pulls an idle worktree forward to the freshest `origin/master`
+// after a long planning phase without ever destroying in-progress work. Only
+// remote-tracking bases are eligible; local-only bases keep warn-only drift.
+async function refreshUnstartedWorktreeToBase(input: {
+  repoRoot: string;
+  worktreePath: string;
+  branchName: string | null;
+  baseRef: string;
+  currentBaseRefSha: string;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{ refreshed: boolean; baseRefSha: string | null }> {
+  if (!parseRemoteTrackingRef(input.baseRef)) {
+    return { refreshed: false, baseRefSha: null };
+  }
+
+  const headSha = await runGit(["rev-parse", "HEAD"], input.worktreePath).catch(() => null);
+  if (!headSha) {
+    return { refreshed: false, baseRefSha: null };
+  }
+  if (headSha === input.currentBaseRefSha) {
+    return { refreshed: false, baseRefSha: input.currentBaseRefSha };
+  }
+
+  const commitsPastBaseRaw = await runGit(
+    ["rev-list", "--count", `${input.currentBaseRefSha}..HEAD`],
+    input.worktreePath,
+  ).catch(() => null);
+  const commitsPastBase = commitsPastBaseRaw === null ? null : Number.parseInt(commitsPastBaseRaw, 10);
+  if (commitsPastBase === null || !Number.isFinite(commitsPastBase) || commitsPastBase > 0) {
+    return { refreshed: false, baseRefSha: null };
+  }
+
+  // Force `--untracked-files=all` so untracked files are counted regardless of a
+  // local `status.showUntrackedFiles=no`; otherwise the clean-tree guard could
+  // pass and the `reset --hard` below would destroy untracked work.
+  const status = await runGit(
+    ["status", "--porcelain", "--untracked-files=all"],
+    input.worktreePath,
+  ).catch(() => null);
+  if (status === null || status.trim().length > 0) {
+    return { refreshed: false, baseRefSha: null };
+  }
+
+  await recordGitOperation(input.recorder, {
+    phase: "worktree_prepare",
+    args: ["reset", "--hard", input.currentBaseRefSha],
+    cwd: input.worktreePath,
+    metadata: {
+      repoRoot: input.repoRoot,
+      worktreePath: input.worktreePath,
+      branchName: input.branchName,
+      baseRef: input.baseRef,
+      previousHeadSha: headSha,
+      baseRefSha: input.currentBaseRefSha,
+      refreshedUnstartedWorktree: true,
+    },
+    successMessage: `Refreshed unstarted git worktree at ${input.worktreePath} to ${input.baseRef} (${formatShortSha(input.currentBaseRefSha)})\n`,
+    failureLabel: `git reset --hard ${input.currentBaseRefSha}`,
+  });
+
+  return { refreshed: true, baseRefSha: input.currentBaseRefSha };
+}
+
+
+type GitWorktreeListEntry = {
+  worktree: string;
+  branch: string | null;
+};
+
+export type ManagedGitWorktreeBranchInspection = {
+  valid: boolean;
+  reason: string | null;
+  reasonCode:
+    | "missing_worktree"
+    | "not_a_git_checkout"
+    | "not_registered"
+    | "wrong_repository_root"
+    | "branch_mismatch"
+    | null;
+  repoRoot: string | null;
+  worktreePath: string;
+  expectedBranchName: string | null;
+  actualBranchName: string | null;
+};
+
+function parseGitWorktreeListPorcelain(raw: string): GitWorktreeListEntry[] {
+  const entries: GitWorktreeListEntry[] = [];
+  let current: Partial<GitWorktreeListEntry> = {};
+
+  for (const line of raw.split(/\r?\n/)) {
+    if (line.startsWith("worktree ")) {
+      current = { worktree: line.slice("worktree ".length) };
+      continue;
+    }
+    if (line.startsWith("branch ")) {
+      current.branch = line.slice("branch ".length);
+      continue;
+    }
+    if (line === "" && current.worktree) {
+      entries.push({
+        worktree: current.worktree,
+        branch: current.branch ?? null,
+      });
+      current = {};
+    }
+  }
+
+  if (current.worktree) {
+    entries.push({
+      worktree: current.worktree,
+      branch: current.branch ?? null,
+    });
+  }
+
+  return entries;
+}
+
+async function resolveGitOwnerRepoRoot(cwd: string): Promise<string> {
+  const checkoutRoot = path.resolve(await runGit(["rev-parse", "--show-toplevel"], cwd));
+  const commonDir = await runGit(["rev-parse", "--git-common-dir"], checkoutRoot).catch(() => null);
+  if (!commonDir) return checkoutRoot;
+  return path.dirname(path.resolve(checkoutRoot, commonDir));
+}
+
+async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: string): Promise<string | null> {
+  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
+  if (!raw) return null;
+
+  const expectedBranchRef = `refs/heads/${branchName}`;
+  for (const entry of parseGitWorktreeListPorcelain(raw)) {
+    if (entry.branch !== expectedBranchRef) continue;
+    return path.resolve(entry.worktree);
+  }
+
+  return null;
+}
+
+async function findRegisteredGitWorktreeByPath(repoRoot: string, worktreePath: string): Promise<GitWorktreeListEntry | null> {
+  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
+  if (!raw) return null;
+
+  const expectedPath = await resolvePathForWorktreeComparison(worktreePath);
+  for (const entry of parseGitWorktreeListPorcelain(raw)) {
+    if (await resolvePathForWorktreeComparison(entry.worktree) === expectedPath) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+async function isGitCheckout(cwd: string): Promise<boolean> {
+  return Boolean(await runGit(["rev-parse", "--git-dir"], cwd).catch(() => null));
+}
+
+async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
+  const originMasterRef = "origin/master";
+  await refreshRemoteTrackingBaseRef(repoRoot, originMasterRef);
+  if (await resolveBaseRefSha(repoRoot, originMasterRef)) {
+    return originMasterRef;
+  }
+
+  // Try the explicit remote HEAD first (set by git clone or git remote set-head)
+  try {
+    const remoteHead = await runGit(
+      ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+      repoRoot,
+    );
+    if (remoteHead) {
+      await refreshRemoteTrackingBaseRef(repoRoot, remoteHead);
+      if (await resolveBaseRefSha(repoRoot, remoteHead)) return remoteHead;
+    }
+  } catch {
+    // Not set — fall through to heuristic
+  }
+
+  // Fallback: check for common default branch names on the remote
+  for (const candidate of ["origin/master", "origin/main", "main", "master"]) {
+    try {
+      await refreshRemoteTrackingBaseRef(repoRoot, candidate);
+      await runGit(["rev-parse", "--verify", `${candidate}^{commit}`], repoRoot);
+      return candidate;
+    } catch {
+      // Not found — try next
+    }
+  }
+
+  return null;
+}
+
 async function directoryExists(value: string) {
   return fs.stat(value).then((stats) => stats.isDirectory()).catch(() => false);
+}
+
+async function resolvePathForWorktreeComparison(value: string): Promise<string> {
+  const resolved = path.resolve(value);
+  return fs.realpath(resolved).then((realPath) => path.resolve(realPath)).catch(() => resolved);
+}
+
+async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>> {
+  const output = await runGit(["worktree", "list", "--porcelain"], repoRoot);
+  const paths = new Set<string>();
+  for (const line of output.split("\n")) {
+    if (!line.startsWith("worktree ")) continue;
+    const worktree = line.slice("worktree ".length).trim();
+    if (!worktree) continue;
+    paths.add(await resolvePathForWorktreeComparison(worktree));
+  }
+  return paths;
+}
+
+export async function inspectManagedGitWorktreeBranch(input: {
+  worktreePath: string;
+  expectedBranchName: string | null | undefined;
+  repoRoot?: string | null;
+}): Promise<ManagedGitWorktreeBranchInspection> {
+  const worktreePath = await resolvePathForWorktreeComparison(input.worktreePath);
+  const expectedBranchName = asString(input.expectedBranchName, "").trim() || null;
+  const base = {
+    worktreePath,
+    expectedBranchName,
+    actualBranchName: null,
+  };
+
+  if (!await directoryExists(worktreePath)) {
+    return {
+      ...base,
+      valid: false,
+      reason: `worktree path "${worktreePath}" does not exist`,
+      reasonCode: "missing_worktree",
+      repoRoot: input.repoRoot ? path.resolve(input.repoRoot) : null,
+    };
+  }
+
+  const repoRoot = input.repoRoot
+    ? path.resolve(input.repoRoot)
+    : await resolveGitOwnerRepoRoot(worktreePath).catch(() => null);
+  if (!repoRoot) {
+    return {
+      ...base,
+      valid: false,
+      reason: "path is not a git checkout",
+      reasonCode: "not_a_git_checkout",
+      repoRoot: null,
+    };
+  }
+
+  const listedWorktrees = await listLinkedGitWorktreePaths(repoRoot).catch(() => null);
+  if (!listedWorktrees?.has(worktreePath)) {
+    return {
+      ...base,
+      valid: false,
+      reason: "path is not registered in `git worktree list`",
+      reasonCode: "not_registered",
+      repoRoot,
+    };
+  }
+
+  const worktreeTopLevel = await runGit(["rev-parse", "--show-toplevel"], worktreePath).catch(() => null);
+  if (!worktreeTopLevel || path.resolve(worktreeTopLevel) !== worktreePath) {
+    return {
+      ...base,
+      valid: false,
+      reason: "git resolves this path to a different repository root",
+      reasonCode: "wrong_repository_root",
+      repoRoot,
+    };
+  }
+
+  const actualBranchName = await runGit(
+    ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    worktreePath,
+  ).catch(() => null);
+  if (expectedBranchName && actualBranchName !== expectedBranchName) {
+    return {
+      ...base,
+      valid: false,
+      reason: `worktree HEAD is on "${actualBranchName ?? "<detached>"}" instead of "${expectedBranchName}"`,
+      reasonCode: "branch_mismatch",
+      repoRoot,
+      actualBranchName,
+    };
+  }
+
+  return {
+    ...base,
+    valid: true,
+    reason: null,
+    reasonCode: null,
+    repoRoot,
+    actualBranchName,
+  };
+}
+
+async function validateLinkedGitWorktree(input: {
+  repoRoot: string;
+  worktreePath: string;
+  expectedBranchName: string | null;
+}): Promise<
+  | { valid: true }
+  | {
+    valid: false;
+    reason: string;
+    reasonCode: Exclude<ManagedGitWorktreeBranchInspection["reasonCode"], null>;
+    actualBranchName?: string | null;
+  }
+> {
+  const inspection = await inspectManagedGitWorktreeBranch({
+    repoRoot: input.repoRoot,
+    worktreePath: input.worktreePath,
+    expectedBranchName: input.expectedBranchName,
+  });
+  return inspection.valid
+    ? { valid: true }
+    : {
+        valid: false,
+        reason: inspection.reason ?? "unknown git worktree mismatch",
+        reasonCode: inspection.reasonCode ?? "not_a_git_checkout",
+        actualBranchName: inspection.actualBranchName,
+      };
+}
+
+export function formatManagedGitWorktreeBranchInspection(input: ManagedGitWorktreeBranchInspection) {
+  return {
+    valid: input.valid,
+    reason: input.reason,
+    reasonCode: input.reasonCode,
+    repoRoot: input.repoRoot,
+    worktreePath: input.worktreePath,
+    expectedBranchName: input.expectedBranchName,
+    actualBranchName: input.actualBranchName,
+  };
 }
 
 function terminateChildProcess(child: ChildProcess) {
@@ -344,19 +1330,47 @@ function buildWorkspaceCommandEnv(input: {
   env.PAPERCLIP_ISSUE_ID = input.issue?.id ?? "";
   env.PAPERCLIP_ISSUE_IDENTIFIER = input.issue?.identifier ?? "";
   env.PAPERCLIP_ISSUE_TITLE = input.issue?.title ?? "";
+  env.PAPERCLIP_ISSUE_WORK_MODE = input.issue?.workMode ?? "";
   return env;
+}
+
+function quoteShellArg(value: string) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function resolveRepoManagedWorkspaceCommand(command: string, repoRoot: string) {
+  const patterns = [
+    /^(?<prefix>(?:bash|sh|zsh)\s+)(?<quote>["']?)(?<relative>\.\/[^"'\s]+)\k<quote>(?<suffix>(?:\s.*)?)$/s,
+    /^(?<quote>["']?)(?<relative>\.\/[^"'\s]+)\k<quote>(?<suffix>(?:\s.*)?)$/s,
+  ];
+
+  for (const pattern of patterns) {
+    const match = command.match(pattern);
+    if (!match?.groups) continue;
+
+    const relativePath = match.groups.relative;
+    const repoManagedPath = path.join(repoRoot, relativePath.slice(2));
+    if (!existsSync(repoManagedPath)) continue;
+
+    const prefix = match.groups.prefix ?? "";
+    const suffix = match.groups.suffix ?? "";
+    return `${prefix}${quoteShellArg(repoManagedPath)}${suffix}`;
+  }
+
+  return command;
 }
 
 async function runWorkspaceCommand(input: {
   command: string;
+  resolvedCommand?: string;
   cwd: string;
   env: NodeJS.ProcessEnv;
   label: string;
 }) {
-  const shell = process.env.SHELL?.trim() || "/bin/sh";
+  const shell = resolveShell();
   const proc = await executeProcess({
     command: shell,
-    args: ["-c", input.command],
+    args: ["-c", input.resolvedCommand ?? input.command],
     cwd: input.cwd,
     env: input.env,
   });
@@ -408,6 +1422,15 @@ async function recordGitOperation(
         stdout: result.stdout,
         stderr: result.stderr,
         system: result.code === 0 ? input.successMessage ?? null : null,
+        metadata:
+          result.stdoutTruncated || result.stderrTruncated
+            ? {
+                stdoutTruncated: result.stdoutTruncated,
+                stderrTruncated: result.stderrTruncated,
+                stdoutBytes: result.stdoutBytes,
+                stderrBytes: result.stderrBytes,
+              }
+            : null,
       };
     },
   });
@@ -428,6 +1451,7 @@ async function recordWorkspaceCommandOperation(
   input: {
     phase: "workspace_provision" | "workspace_teardown";
     command: string;
+    resolvedCommand?: string;
     cwd: string;
     env: NodeJS.ProcessEnv;
     label: string;
@@ -437,22 +1461,22 @@ async function recordWorkspaceCommandOperation(
 ) {
   if (!recorder) {
     await runWorkspaceCommand(input);
-    return;
+    return null;
   }
 
   let stdout = "";
   let stderr = "";
   let code: number | null = null;
-  await recorder.recordOperation({
+  const operation = await recorder.recordOperation({
     phase: input.phase,
     command: input.command,
     cwd: input.cwd,
     metadata: input.metadata ?? null,
     run: async () => {
-      const shell = process.env.SHELL?.trim() || "/bin/sh";
+      const shell = resolveShell();
       const result = await executeProcess({
         command: shell,
-        args: ["-c", input.command],
+        args: ["-c", input.resolvedCommand ?? input.command],
         cwd: input.cwd,
         env: input.env,
       });
@@ -465,11 +1489,20 @@ async function recordWorkspaceCommandOperation(
         stdout: result.stdout,
         stderr: result.stderr,
         system: result.code === 0 ? input.successMessage ?? null : null,
+        metadata:
+          result.stdoutTruncated || result.stderrTruncated
+            ? {
+                stdoutTruncated: result.stdoutTruncated,
+                stderrTruncated: result.stderrTruncated,
+                stdoutBytes: result.stdoutBytes,
+                stderrBytes: result.stderrBytes,
+              }
+            : null,
       };
     },
   });
 
-  if (code === 0) return;
+  if (code === 0) return operation;
 
   const details = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
   throw new Error(
@@ -492,10 +1525,12 @@ async function provisionExecutionWorktree(input: {
 }) {
   const provisionCommand = asString(input.strategy.provisionCommand, "").trim();
   if (!provisionCommand) return;
+  const resolvedProvisionCommand = resolveRepoManagedWorkspaceCommand(provisionCommand, input.repoRoot);
 
   await recordWorkspaceCommandOperation(input.recorder, {
     phase: "workspace_provision",
     command: provisionCommand,
+    resolvedCommand: resolvedProvisionCommand,
     cwd: input.worktreePath,
     env: buildWorkspaceCommandEnv({
       base: input.base,
@@ -512,6 +1547,7 @@ async function provisionExecutionWorktree(input: {
       worktreePath: input.worktreePath,
       branchName: input.branchName,
       created: input.created,
+      resolvedCommand: resolvedProvisionCommand === provisionCommand ? null : resolvedProvisionCommand,
     },
     successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
   });
@@ -584,10 +1620,11 @@ export async function realizeExecutionWorkspace(input: {
       worktreePath: null,
       warnings: [],
       created: false,
+      baseRefSha: null,
     };
   }
 
-  const repoRoot = await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd);
+  const repoRoot = await resolveGitOwnerRepoRoot(input.base.baseCwd);
   const branchTemplate = asString(rawStrategy.branchTemplate, "{{issue.identifier}}-{{slug}}");
   const renderedBranch = renderWorkspaceTemplate(branchTemplate, {
     issue: input.issue,
@@ -601,55 +1638,129 @@ export async function realizeExecutionWorkspace(input: {
     ? resolveConfiguredPath(configuredParentDir, repoRoot)
     : path.join(repoRoot, ".paperclip", "worktrees");
   const worktreePath = path.join(worktreeParentDir, branchName);
-  const baseRef = asString(rawStrategy.baseRef, input.base.repoRef ?? "HEAD");
+  const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
+    ? rawStrategy.baseRef
+    : input.base.repoRef ?? null;
+  const {
+    baseRef,
+    warnings: baseRefResolutionWarnings,
+    refreshed: baseRefAlreadyRefreshed,
+  } = await resolveAuthoritativeBaseRef(repoRoot, configuredBaseRef);
+  const baseRefreshWarnings = [
+    ...baseRefResolutionWarnings,
+    ...(baseRefAlreadyRefreshed ? [] : await refreshRemoteTrackingBaseRef(repoRoot, baseRef)),
+  ];
+  const currentBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
 
-  const existingWorktree = await directoryExists(worktreePath);
-  if (existingWorktree) {
-    const existingGitDir = await runGit(["rev-parse", "--git-dir"], worktreePath).catch(() => null);
-    if (existingGitDir) {
-      if (input.recorder) {
-        await input.recorder.recordOperation({
-          phase: "worktree_prepare",
-          cwd: repoRoot,
-          metadata: {
-            repoRoot,
-            worktreePath,
-            branchName,
-            baseRef,
-            created: false,
-            reused: true,
-          },
-          run: async () => ({
-            status: "succeeded",
-            exitCode: 0,
-            system: `Reused existing git worktree at ${worktreePath}\n`,
-          }),
-        });
-      }
-      await provisionExecutionWorktree({
-        strategy: rawStrategy,
-        base: input.base,
+  async function reuseExistingWorktree(reusablePath: string) {
+    const refresh = currentBaseRefSha
+      ? await refreshUnstartedWorktreeToBase({
+          repoRoot,
+          worktreePath: reusablePath,
+          branchName,
+          baseRef,
+          currentBaseRefSha,
+          recorder: input.recorder ?? null,
+        })
+      : { refreshed: false, baseRefSha: null };
+    const baseDrift = await inspectExecutionWorkspaceBaseDrift({
+      repoRoot,
+      worktreePath: reusablePath,
+      branchName,
+      baseRef,
+      recordedBaseRefSha: null,
+      skipRefresh: true,
+    });
+    if (input.recorder) {
+      await input.recorder.recordOperation({
+        phase: "worktree_prepare",
+        cwd: repoRoot,
+        metadata: {
+          repoRoot,
+          worktreePath: reusablePath,
+          branchName,
+          baseRef,
+          currentBaseRefSha: baseDrift.currentBaseRefSha,
+          branchBaseRefSha: baseDrift.branchBaseRefSha,
+          created: false,
+          reused: true,
+        },
+        run: async () => ({
+          status: "succeeded",
+          exitCode: 0,
+          system: `Reused existing git worktree at ${reusablePath}\n`,
+        }),
+      });
+    }
+    await provisionExecutionWorktree({
+      strategy: rawStrategy,
+      base: input.base,
+      repoRoot,
+      worktreePath: reusablePath,
+      branchName,
+      issue: input.issue,
+      agent: input.agent,
+      created: false,
+      recorder: input.recorder ?? null,
+    });
+    return {
+      ...input.base,
+      repoRef: baseRef,
+      strategy: "git_worktree" as const,
+      cwd: reusablePath,
+      branchName,
+      worktreePath: reusablePath,
+      warnings: [...baseRefreshWarnings, ...baseDrift.warnings],
+      created: false,
+      baseRefSha: refresh.baseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,
+    };
+  }
+
+  async function validateReusableWorktree(reusablePath: string) {
+    const validation = await validateLinkedGitWorktree({
+      repoRoot,
+      worktreePath: reusablePath,
+      expectedBranchName: branchName,
+    }).catch(() => null);
+    if (validation && !validation.valid && validation.reasonCode === "branch_mismatch") {
+      await ensureGitWorktreeBranchCoherent({
         repoRoot,
-        worktreePath,
-        branchName,
-        issue: input.issue,
-        agent: input.agent,
-        created: false,
+        worktreePath: reusablePath,
+        expectedBranchName: branchName,
+        actualBranchName: validation.actualBranchName ?? null,
+        sourceIssue: input.issue,
+        executionWorkspaceId: null,
         recorder: input.recorder ?? null,
       });
-      return {
-        ...input.base,
-        strategy: "git_worktree",
-        cwd: worktreePath,
-        branchName,
-        worktreePath,
-        warnings: [],
-        created: false,
-      };
+      return await validateLinkedGitWorktree({
+        repoRoot,
+        worktreePath: reusablePath,
+        expectedBranchName: branchName,
+      }).catch(() => null);
     }
-    throw new Error(`Configured worktree path "${worktreePath}" already exists and is not a git worktree.`);
+    return validation;
+  }
+
+  const existingWorktree = await directoryExists(worktreePath);
+  if (existingWorktree) {
+    const validation = await validateReusableWorktree(worktreePath);
+    if (validation?.valid) {
+      return await reuseExistingWorktree(worktreePath);
+    }
+    const reason = validation && !validation.valid ? ` (${validation.reason})` : "";
+    throw new Error(`Configured worktree path "${worktreePath}" already exists and is not a reusable git worktree${reason}.`);
+  }
+
+  const registeredBranchWorktree = await findRegisteredGitWorktreeByBranch(repoRoot, branchName);
+  if (registeredBranchWorktree) {
+    const validation = await validateReusableWorktree(registeredBranchWorktree);
+    if (validation?.valid) {
+      return await reuseExistingWorktree(registeredBranchWorktree);
+    }
+    const reason = validation && !validation.valid ? ` (${validation.reason})` : "";
+    throw new Error(`Registered worktree for branch "${branchName}" at "${registeredBranchWorktree}" is not reusable${reason}.`);
   }
 
   try {
@@ -662,6 +1773,7 @@ export async function realizeExecutionWorkspace(input: {
         worktreePath,
         branchName,
         baseRef,
+        baseRefSha: currentBaseRefSha,
         created: true,
       },
       successMessage: `Created git worktree at ${worktreePath}\n`,
@@ -671,21 +1783,33 @@ export async function realizeExecutionWorkspace(input: {
     if (!gitErrorIncludes(error, "already exists")) {
       throw error;
     }
-    await recordGitOperation(input.recorder, {
-      phase: "worktree_prepare",
-      args: ["worktree", "add", worktreePath, branchName],
-      cwd: repoRoot,
-      metadata: {
-        repoRoot,
-        worktreePath,
-        branchName,
-        baseRef,
-        created: false,
-        reusedExistingBranch: true,
-      },
-      successMessage: `Attached existing branch ${branchName} at ${worktreePath}\n`,
-      failureLabel: `git worktree add ${worktreePath}`,
-    });
+    try {
+      await recordGitOperation(input.recorder, {
+        phase: "worktree_prepare",
+        args: ["worktree", "add", worktreePath, branchName],
+        cwd: repoRoot,
+        metadata: {
+          repoRoot,
+          worktreePath,
+          branchName,
+          baseRef,
+          baseRefSha: currentBaseRefSha,
+          created: false,
+          reusedExistingBranch: true,
+        },
+        successMessage: `Attached existing branch ${branchName} at ${worktreePath}\n`,
+        failureLabel: `git worktree add ${worktreePath}`,
+      });
+    } catch (attachError) {
+      if (!gitErrorIncludes(attachError, "already checked out")) {
+        throw attachError;
+      }
+      const reusablePath = await findRegisteredGitWorktreeByBranch(repoRoot, branchName);
+      if (!reusablePath || !await isGitCheckout(reusablePath)) {
+        throw attachError;
+      }
+      return await reuseExistingWorktree(reusablePath);
+    }
   }
   await provisionExecutionWorktree({
     strategy: rawStrategy,
@@ -701,12 +1825,235 @@ export async function realizeExecutionWorkspace(input: {
 
   return {
     ...input.base,
+    repoRef: baseRef,
     strategy: "git_worktree",
     cwd: worktreePath,
     branchName,
     worktreePath,
-    warnings: [],
+    warnings: baseRefreshWarnings,
     created: true,
+    baseRefSha: currentBaseRefSha,
+  };
+}
+
+export async function ensurePersistedExecutionWorkspaceAvailable(input: {
+  base: ExecutionWorkspaceInput;
+  workspace: {
+    id?: string | null;
+    mode: string | null | undefined;
+    strategyType: string | null | undefined;
+    cwd: string | null | undefined;
+    providerRef: string | null | undefined;
+    projectId: string | null | undefined;
+    projectWorkspaceId: string | null | undefined;
+    repoUrl: string | null | undefined;
+    baseRef: string | null | undefined;
+    branchName: string | null | undefined;
+    metadata?: Record<string, unknown> | null;
+    config?: {
+      provisionCommand?: string | null;
+    } | null;
+  };
+  issue: ExecutionWorkspaceIssueRef | null;
+  agent: ExecutionWorkspaceAgentRef;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<RealizedExecutionWorkspace | null> {
+  const cwd = asString(input.workspace.cwd ?? input.workspace.providerRef, "").trim();
+  if (!cwd) return null;
+
+  const strategy = input.workspace.strategyType === "git_worktree" ? "git_worktree" : "project_primary";
+  const realized: RealizedExecutionWorkspace = {
+    baseCwd: input.base.baseCwd,
+    source: input.workspace.mode === "shared_workspace" ? "project_primary" : "task_session",
+    projectId: input.workspace.projectId ?? input.base.projectId,
+    workspaceId: input.workspace.projectWorkspaceId ?? input.base.workspaceId,
+    repoUrl: input.workspace.repoUrl ?? input.base.repoUrl,
+    repoRef: input.workspace.baseRef ?? input.base.repoRef,
+    strategy,
+    cwd,
+    branchName: input.workspace.branchName ?? null,
+    worktreePath: strategy === "git_worktree" ? (input.workspace.providerRef ?? cwd) : null,
+    warnings: [],
+    created: false,
+    baseRefSha: readRecordedBaseRefSha(input.workspace.metadata),
+  };
+  const provisionCommand = asString(input.workspace.config?.provisionCommand, "").trim();
+
+  if (strategy !== "git_worktree") {
+    if (!await directoryExists(cwd)) {
+      return null;
+    }
+    return realized;
+  }
+  const repoRoot = await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd);
+  const recordedBaseRefSha = readRecordedBaseRefSha(input.workspace.metadata);
+  if (await directoryExists(cwd)) {
+    const reuseBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
+    const reuseWorktreePath = realized.worktreePath ?? cwd;
+    if (await isGitCheckout(reuseWorktreePath)) {
+      await ensureGitWorktreeBranchCoherent({
+        repoRoot,
+        worktreePath: reuseWorktreePath,
+        expectedBranchName: realized.branchName,
+        sourceIssue: input.issue,
+        executionWorkspaceId: input.workspace.id ?? null,
+        recorder: input.recorder ?? null,
+      });
+    }
+    const validation = await validateLinkedGitWorktree({
+      repoRoot,
+      worktreePath: reuseWorktreePath,
+      expectedBranchName: realized.branchName,
+    });
+    if (!validation.valid) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Persisted git worktree "${reuseWorktreePath}" is not reusable (${validation.reason}).`,
+        {
+          workspaceValidation: {
+            reason: "git_worktree_not_reusable",
+            reasonCode: validation.reasonCode,
+            worktreePath: reuseWorktreePath,
+            executionWorkspaceId: input.workspace.id ?? null,
+          },
+        },
+      );
+    }
+    const baseRefreshWarnings = reuseBaseRef
+      ? await refreshRemoteTrackingBaseRef(repoRoot, reuseBaseRef)
+      : [];
+    const currentBaseRefSha = reuseBaseRef ? await resolveBaseRefSha(repoRoot, reuseBaseRef) : null;
+    const refresh = reuseBaseRef && currentBaseRefSha
+      ? await refreshUnstartedWorktreeToBase({
+          repoRoot,
+          worktreePath: reuseWorktreePath,
+          branchName: realized.branchName,
+          baseRef: reuseBaseRef,
+          currentBaseRefSha,
+          recorder: input.recorder ?? null,
+        })
+      : { refreshed: false, baseRefSha: null };
+    const baseDrift = await inspectExecutionWorkspaceBaseDrift({
+      repoRoot,
+      worktreePath: reuseWorktreePath,
+      branchName: realized.branchName,
+      baseRef: reuseBaseRef,
+      recordedBaseRefSha,
+      skipRefresh: true,
+    });
+    realized.warnings = [...baseRefreshWarnings, ...baseDrift.warnings];
+    realized.baseRefSha = refresh.baseRefSha ?? recordedBaseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha;
+    if (provisionCommand) {
+      await provisionExecutionWorktree({
+        strategy: {
+          type: "git_worktree",
+          provisionCommand,
+        },
+        base: input.base,
+        repoRoot,
+        worktreePath: realized.worktreePath ?? cwd,
+        branchName: realized.branchName ?? "",
+        issue: input.issue,
+        agent: input.agent,
+        created: false,
+        recorder: input.recorder ?? null,
+      });
+    }
+    return realized;
+  }
+
+  const worktreePath = realized.worktreePath ?? cwd;
+  const branchName = asString(input.workspace.branchName, "").trim();
+  if (!branchName) {
+    throw new Error(`Execution workspace "${cwd}" is missing and cannot be restored because no branch name is recorded.`);
+  }
+
+  await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+  await runGit(["worktree", "prune"], repoRoot).catch(() => {});
+  const restoreBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
+  const restoreRefreshWarnings = restoreBaseRef ? await refreshRemoteTrackingBaseRef(repoRoot, restoreBaseRef) : [];
+  const restoreCurrentBaseRefSha = restoreBaseRef ? await resolveBaseRefSha(repoRoot, restoreBaseRef) : null;
+
+  let created = false;
+  try {
+    await recordGitOperation(input.recorder, {
+      phase: "worktree_prepare",
+      args: ["worktree", "add", worktreePath, branchName],
+      cwd: repoRoot,
+      metadata: {
+        repoRoot,
+        worktreePath,
+        branchName,
+        baseRef: input.workspace.baseRef ?? input.base.repoRef ?? null,
+        currentBaseRefSha: restoreCurrentBaseRefSha,
+        created: false,
+        restored: true,
+      },
+      successMessage: `Reattached missing git worktree at ${worktreePath}\n`,
+      failureLabel: `git worktree add ${worktreePath}`,
+    });
+  } catch (error) {
+    if (
+      !gitErrorIncludes(error, "invalid reference")
+      && !gitErrorIncludes(error, "not a commit")
+      && !gitErrorIncludes(error, "unknown revision")
+    ) {
+      throw error;
+    }
+    const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
+    const recreatedBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
+    await recordGitOperation(input.recorder, {
+      phase: "worktree_prepare",
+      args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
+      cwd: repoRoot,
+      metadata: {
+        repoRoot,
+        worktreePath,
+        branchName,
+        baseRef,
+        baseRefSha: recreatedBaseRefSha,
+        created: true,
+        restored: true,
+      },
+      successMessage: `Recreated missing git worktree at ${worktreePath}\n`,
+      failureLabel: `git worktree add ${worktreePath}`,
+    });
+    created = true;
+  }
+
+  const baseDrift = await inspectExecutionWorkspaceBaseDrift({
+    repoRoot,
+    worktreePath,
+    branchName,
+    baseRef: input.workspace.baseRef ?? input.base.repoRef ?? null,
+    recordedBaseRefSha,
+    skipRefresh: true,
+  });
+
+  await provisionExecutionWorktree({
+    strategy: {
+      type: "git_worktree",
+      ...(provisionCommand ? { provisionCommand } : {}),
+    },
+    base: input.base,
+    repoRoot,
+    worktreePath,
+    branchName,
+    issue: input.issue,
+    agent: input.agent,
+    created,
+    recorder: input.recorder ?? null,
+  });
+
+  return {
+    ...realized,
+    cwd: worktreePath,
+    worktreePath,
+    warnings: [...restoreRefreshWarnings, ...baseDrift.warnings],
+    created,
+    baseRefSha:
+      recordedBaseRefSha
+      ?? (created ? restoreCurrentBaseRefSha : baseDrift.branchBaseRefSha)
+      ?? baseDrift.currentBaseRefSha,
   };
 }
 
@@ -734,6 +2081,12 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
 }) {
   const warnings: string[] = [];
   const workspacePath = input.workspace.providerRef ?? input.workspace.cwd;
+  const repoRoot = input.workspace.providerType === "git_worktree" && workspacePath
+    ? await resolveGitRepoRootForWorkspaceCleanup(
+      workspacePath,
+      input.projectWorkspace?.cwd ?? null,
+    )
+    : null;
   const cleanupEnv = buildExecutionWorkspaceCleanupEnv({
     workspace: input.workspace,
     projectWorkspaceCwd: input.projectWorkspace?.cwd ?? null,
@@ -749,9 +2102,13 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
 
   for (const command of cleanupCommands) {
     try {
+      const resolvedCommand = repoRoot
+        ? resolveRepoManagedWorkspaceCommand(command, repoRoot)
+        : command;
       await recordWorkspaceCommandOperation(input.recorder, {
         phase: "workspace_teardown",
         command,
+        resolvedCommand,
         cwd: workspacePath ?? input.projectWorkspace?.cwd ?? process.cwd(),
         env: cleanupEnv,
         label: `Execution workspace cleanup command "${command}"`,
@@ -760,6 +2117,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
           workspacePath,
           branchName: input.workspace.branchName,
           providerType: input.workspace.providerType,
+          resolvedCommand: resolvedCommand === command ? null : resolvedCommand,
         },
         successMessage: `Completed cleanup command "${command}"\n`,
       });
@@ -769,10 +2127,6 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   }
 
   if (input.workspace.providerType === "git_worktree" && workspacePath) {
-    const repoRoot = await resolveGitRepoRootForWorkspaceCleanup(
-      workspacePath,
-      input.projectWorkspace?.cwd ?? null,
-    );
     const worktreeExists = await directoryExists(workspacePath);
     if (worktreeExists) {
       if (!repoRoot) {
@@ -996,6 +2350,83 @@ function resolveRuntimeServiceReuseIdentity(input: {
   };
 }
 
+function resolveWorkspaceCommandExecution(input: {
+  command: Record<string, unknown>;
+  workspace: RealizedExecutionWorkspace;
+  agent: ExecutionWorkspaceAgentRef;
+  issue: ExecutionWorkspaceIssueRef | null;
+  adapterEnv: Record<string, string>;
+}) {
+  const name =
+    asString(input.command.name, "")
+    || asString(input.command.label, "")
+    || asString(input.command.title, "")
+    || "workspace command";
+  const command = asString(input.command.command, "");
+  const templateData = buildTemplateData({
+    workspace: input.workspace,
+    agent: input.agent,
+    issue: input.issue,
+    adapterEnv: input.adapterEnv,
+    port: null,
+  });
+  const cwd = resolveConfiguredPath(
+    renderTemplate(asString(input.command.cwd, "."), templateData),
+    input.workspace.cwd,
+  );
+  const env = {
+    ...sanitizeRuntimeServiceBaseEnv(process.env),
+    ...input.adapterEnv,
+    ...renderRuntimeServiceEnv({
+      envConfig: parseObject(input.command.env),
+      templateData,
+    }),
+  } as Record<string, string>;
+
+  return {
+    name,
+    command,
+    cwd,
+    env,
+  };
+}
+
+export async function runWorkspaceJobForControl(input: {
+  actor: ExecutionWorkspaceAgentRef;
+  issue: ExecutionWorkspaceIssueRef | null;
+  workspace: RealizedExecutionWorkspace;
+  command: Record<string, unknown>;
+  adapterEnv?: Record<string, string>;
+  recorder?: WorkspaceOperationRecorder | null;
+  metadata?: Record<string, unknown> | null;
+}) {
+  const resolved = resolveWorkspaceCommandExecution({
+    command: input.command,
+    workspace: input.workspace,
+    agent: input.actor,
+    issue: input.issue,
+    adapterEnv: input.adapterEnv ?? {},
+  });
+  if (!resolved.command) {
+    throw new Error(`Workspace job "${resolved.name}" is missing command`);
+  }
+
+  await ensureServerWorkspaceLinksCurrent(resolved.cwd);
+  return await recordWorkspaceCommandOperation(input.recorder, {
+    phase: "workspace_provision",
+    command: resolved.command,
+    cwd: resolved.cwd,
+    env: resolved.env,
+    label: `Workspace job "${resolved.name}"`,
+    metadata: {
+      workspaceCommandKind: "job",
+      workspaceCommandName: resolved.name,
+      ...(input.metadata ?? {}),
+    },
+    successMessage: `Completed workspace job "${resolved.name}"\n`,
+  });
+}
+
 function resolveServiceScopeId(input: {
   service: Record<string, unknown>;
   workspace: RealizedExecutionWorkspace;
@@ -1022,6 +2453,21 @@ function resolveServiceScopeId(input: {
   return { scopeType: "run" as const, scopeId: input.runId };
 }
 
+function looksLikeWorkspaceDevServerCommand(command: string) {
+  const normalized = command.trim().toLowerCase();
+  if (!normalized) return false;
+  return /(?:^|\s)(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?dev(?:\s|$)/.test(normalized);
+}
+
+export function resolveWorkspaceRuntimeReadinessTimeoutSec(service: Record<string, unknown>) {
+  const readiness = parseObject(service.readiness);
+  const explicitTimeoutSec = asNumber(readiness.timeoutSec, 0);
+  if (explicitTimeoutSec > 0) {
+    return Math.max(1, explicitTimeoutSec);
+  }
+  return looksLikeWorkspaceDevServerCommand(asString(service.command, "")) ? 90 : 30;
+}
+
 async function waitForReadiness(input: {
   service: Record<string, unknown>;
   url: string | null;
@@ -1029,7 +2475,7 @@ async function waitForReadiness(input: {
   const readiness = parseObject(input.service.readiness);
   const readinessType = asString(readiness.type, "");
   if (readinessType !== "http" || !input.url) return;
-  const timeoutSec = Math.max(1, asNumber(readiness.timeoutSec, 30));
+  const timeoutSec = resolveWorkspaceRuntimeReadinessTimeoutSec(input.service);
   const intervalMs = Math.max(100, asNumber(readiness.intervalMs, 500));
   const deadline = Date.now() + timeoutSec * 1000;
   let lastError = "service did not become ready";
@@ -1044,6 +2490,50 @@ async function waitForReadiness(input: {
     await delay(intervalMs);
   }
   throw new Error(`Readiness check failed for ${input.url}: ${lastError}`);
+}
+
+function isPaperclipDevRuntimeService(input: { serviceName?: string | null; command?: string | null }) {
+  const serviceName = (input.serviceName ?? "").trim().toLowerCase();
+  const command = (input.command ?? "").trim().toLowerCase();
+  return (
+    serviceName === "paperclip-dev"
+    || serviceName === "paperclip-dev-once"
+    || (command.includes("dev:once") && command.includes("tailscale-auth"))
+  );
+}
+
+function resolveRuntimeServiceHealthUrl(
+  url: string | null,
+  input?: { serviceName?: string | null; command?: string | null },
+) {
+  if (!url || !isPaperclipDevRuntimeService(input ?? {})) return url;
+  try {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/" || parsed.pathname === "") {
+      parsed.pathname = "/api/health";
+      parsed.search = "";
+      parsed.hash = "";
+      return parsed.toString();
+    }
+  } catch {
+    return url;
+  }
+  return url;
+}
+
+async function isRuntimeServiceUrlHealthy(
+  url: string | null,
+  input?: { serviceName?: string | null; command?: string | null },
+) {
+  if (!url) return true;
+  const healthUrl = resolveRuntimeServiceHealthUrl(url, input);
+  if (!healthUrl) return true;
+  try {
+    const response = await fetch(healthUrl, { signal: AbortSignal.timeout(2_000) });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 function toPersistedWorkspaceRuntimeService(record: RuntimeServiceRecord): typeof workspaceRuntimeServices.$inferInsert {
@@ -1112,6 +2602,33 @@ async function persistRuntimeServiceRecord(db: Db | undefined, record: RuntimeSe
         updatedAt: values.updatedAt,
       },
     });
+}
+
+async function findStoppedRuntimeServiceReuseCandidate(input: {
+  db?: Db;
+  companyId: string;
+  reuseKey: string | null;
+}): Promise<StoppedRuntimeServiceReuseCandidate | null> {
+  if (!input.db || !input.reuseKey) return null;
+  const row = await input.db
+    .select({
+      id: workspaceRuntimeServices.id,
+      port: workspaceRuntimeServices.port,
+    })
+    .from(workspaceRuntimeServices)
+    .where(
+      and(
+        eq(workspaceRuntimeServices.companyId, input.companyId),
+        eq(workspaceRuntimeServices.reuseKey, input.reuseKey),
+        eq(workspaceRuntimeServices.provider, "local_process"),
+        eq(workspaceRuntimeServices.status, "stopped"),
+      ),
+    )
+    .orderBy(desc(workspaceRuntimeServices.updatedAt))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+
+  return row ?? null;
 }
 
 function clearIdleTimer(record: RuntimeServiceRecord) {
@@ -1226,9 +2743,19 @@ async function startLocalRuntimeService(input: {
   const serviceIdentityFingerprint = input.reuseKey ?? envFingerprint;
   const explicitPort = identity.explicitPort;
   const identityPort = identity.identityPort;
+  const stoppedReuseCandidate = await findStoppedRuntimeServiceReuseCandidate({
+    db: input.db,
+    companyId: input.agent.companyId,
+    reuseKey: input.reuseKey,
+  });
+  let reusableStoppedPort: number | null = null;
+  if (asString(portConfig.type, "") === "auto" && stoppedReuseCandidate?.port) {
+    const ownerPid = await readLocalServicePortOwner(stoppedReuseCandidate.port);
+    reusableStoppedPort = ownerPid ? null : stoppedReuseCandidate.port;
+  }
   const port =
     asString(portConfig.type, "") === "auto"
-      ? await allocatePort()
+      ? (reusableStoppedPort ?? await allocatePort())
       : explicitPort > 0
         ? explicitPort
         : null;
@@ -1254,6 +2781,7 @@ async function startLocalRuntimeService(input: {
     const portEnvKey = asString(portConfig.envKey, "PORT");
     env[portEnvKey] = String(port);
   }
+
   const expose = parseObject(input.service.expose);
   const readiness = parseObject(input.service.readiness);
   const urlTemplate =
@@ -1277,48 +2805,57 @@ async function startLocalRuntimeService(input: {
   });
   const adoptedRecord = await findAdoptableLocalService({
     serviceKey,
+    profileKind: "workspace-runtime",
+    serviceName,
     command,
     cwd: serviceCwd,
     envFingerprint: serviceIdentityFingerprint,
-    port: identityPort,
+    port: port ?? identityPort,
+    url,
   });
   if (adoptedRecord) {
-    return {
-      id: adoptedRecord.runtimeServiceId ?? randomUUID(),
-      companyId: input.agent.companyId,
-      projectId: input.workspace.projectId,
-      projectWorkspaceId: input.workspace.workspaceId,
-      executionWorkspaceId: input.executionWorkspaceId ?? null,
-      issueId: input.issue?.id ?? null,
-      serviceName,
-      status: "running",
-      lifecycle,
-      scopeType: input.scopeType,
-      scopeId: input.scopeId,
-      reuseKey: input.reuseKey,
-      command,
-      cwd: serviceCwd,
-      port: adoptedRecord.port ?? port,
-      url: adoptedRecord.url ?? url,
-      provider: "local_process",
-      providerRef: String(adoptedRecord.pid),
-      ownerAgentId: input.agent.id ?? null,
-      startedByRunId,
-      lastUsedAt: new Date().toISOString(),
-      startedAt: adoptedRecord.startedAt,
-      stoppedAt: null,
-      stopPolicy,
-      healthStatus: "healthy",
-      reused: true,
-      db: input.db,
-      child: null,
-      leaseRunIds: leaseRunId ? new Set([leaseRunId]) : new Set(),
-      idleTimer: null,
-      envFingerprint,
-      serviceKey,
-      profileKind: "workspace-runtime",
-      processGroupId: adoptedRecord.processGroupId ?? null,
-    };
+    const adoptedUrl = adoptedRecord.url ?? url;
+    if (!(await isRuntimeServiceUrlHealthy(adoptedUrl, { serviceName, command }))) {
+      await terminateLocalService(adoptedRecord);
+      await removeLocalServiceRegistryRecord(adoptedRecord.serviceKey);
+    } else {
+      return {
+        id: adoptedRecord.runtimeServiceId ?? randomUUID(),
+        companyId: input.agent.companyId,
+        projectId: input.workspace.projectId,
+        projectWorkspaceId: input.workspace.workspaceId,
+        executionWorkspaceId: input.executionWorkspaceId ?? null,
+        issueId: input.issue?.id ?? null,
+        serviceName,
+        status: "running",
+        lifecycle,
+        scopeType: input.scopeType,
+        scopeId: input.scopeId,
+        reuseKey: input.reuseKey,
+        command,
+        cwd: serviceCwd,
+        port: adoptedRecord.port ?? port,
+        url: adoptedRecord.url ?? url,
+        provider: "local_process",
+        providerRef: String(adoptedRecord.pid),
+        ownerAgentId: input.agent.id ?? null,
+        startedByRunId,
+        lastUsedAt: new Date().toISOString(),
+        startedAt: adoptedRecord.startedAt,
+        stoppedAt: null,
+        stopPolicy,
+        healthStatus: "healthy",
+        reused: true,
+        db: input.db,
+        child: null,
+        leaseRunIds: leaseRunId ? new Set([leaseRunId]) : new Set(),
+        idleTimer: null,
+        envFingerprint,
+        serviceKey,
+        profileKind: "workspace-runtime",
+        processGroupId: adoptedRecord.processGroupId ?? null,
+      };
+    }
   }
   if (identityPort) {
     const ownerPid = await readLocalServicePortOwner(identityPort);
@@ -1328,12 +2865,22 @@ async function startLocalRuntimeService(input: {
       );
     }
   }
-  const shell = process.env.SHELL?.trim() || "/bin/sh";
+
+  await ensureServerWorkspaceLinksCurrent(serviceCwd, {
+    onLog: input.onLog,
+  });
+
+  const shell = resolveShell();
   const child = spawn(shell, ["-lc", command], {
     cwd: serviceCwd,
     env,
     detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
+  });
+  const spawnErrorPromise = new Promise<never>((_, reject) => {
+    child.once("error", (err) => {
+      reject(err);
+    });
   });
   let stderrExcerpt = "";
   let stdoutExcerpt = "";
@@ -1349,7 +2896,10 @@ async function startLocalRuntimeService(input: {
   });
 
   try {
-    await waitForReadiness({ service: input.service, url });
+    await Promise.race([
+      waitForReadiness({ service: input.service, url }),
+      spawnErrorPromise,
+    ]);
   } catch (err) {
     terminateChildProcess(child);
     throw new Error(
@@ -1358,7 +2908,7 @@ async function startLocalRuntimeService(input: {
   }
 
   const record: RuntimeServiceRecord = {
-    id: randomUUID(),
+    id: stoppedReuseCandidate?.id ?? randomUUID(),
     companyId: input.agent.companyId,
     projectId: input.workspace.projectId,
     projectWorkspaceId: input.workspace.workspaceId,
@@ -1513,10 +3063,93 @@ function registerRuntimeService(db: Db | undefined, record: RuntimeServiceRecord
 }
 
 function readRuntimeServiceEntries(config: Record<string, unknown>) {
-  const runtime = parseObject(config.workspaceRuntime);
-  return Array.isArray(runtime.services)
-    ? runtime.services.filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null)
-    : [];
+  return listWorkspaceServiceCommandDefinitions(parseObject(config.workspaceRuntime))
+    .map((command) => command.rawConfig);
+}
+
+export function listConfiguredRuntimeServiceEntries(config: Record<string, unknown>) {
+  return readRuntimeServiceEntries(config);
+}
+
+function readConfiguredServiceStates(config: Record<string, unknown>) {
+  const raw = parseObject(config.serviceStates);
+  const states: WorkspaceRuntimeServiceStateMap = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (value === "running" || value === "stopped" || value === "manual") {
+      states[key] = value;
+    }
+  }
+  return states;
+}
+
+function readDesiredRuntimeState(value: unknown): WorkspaceRuntimeDesiredState | null {
+  return value === "running" || value === "stopped" || value === "manual" ? value : null;
+}
+
+export function buildWorkspaceRuntimeDesiredStatePatch(input: {
+  config: Record<string, unknown>;
+  currentDesiredState: WorkspaceRuntimeDesiredState | null;
+  currentServiceStates: WorkspaceRuntimeServiceStateMap | null | undefined;
+  action: "start" | "stop" | "restart";
+  serviceIndex?: number | null;
+}): {
+  desiredState: WorkspaceRuntimeDesiredState;
+  serviceStates: WorkspaceRuntimeServiceStateMap | null;
+} {
+  const configuredServices = listConfiguredRuntimeServiceEntries(input.config);
+  const fallbackState: WorkspaceRuntimeDesiredState = readDesiredRuntimeState(input.currentDesiredState) ?? "stopped";
+  const nextServiceStates: WorkspaceRuntimeServiceStateMap = {};
+
+  for (let index = 0; index < configuredServices.length; index += 1) {
+    nextServiceStates[String(index)] = input.currentServiceStates?.[String(index)] ?? fallbackState;
+  }
+
+  const nextState: WorkspaceRuntimeDesiredState = input.action === "stop" ? "stopped" : "running";
+  const applyActionState = (index: number) => {
+    const key = String(index);
+    // Manual services are intentionally left under operator control even when
+    // an API action targets that individual service.
+    if (nextServiceStates[key] === "manual") return;
+    nextServiceStates[key] = nextState;
+  };
+  if (input.serviceIndex === undefined || input.serviceIndex === null) {
+    for (let index = 0; index < configuredServices.length; index += 1) {
+      applyActionState(index);
+    }
+  } else if (input.serviceIndex >= 0 && input.serviceIndex < configuredServices.length) {
+    applyActionState(input.serviceIndex);
+  }
+
+  const desiredState = Object.values(nextServiceStates).some((state) => state === "running")
+    ? "running"
+    : Object.values(nextServiceStates).some((state) => state === "manual")
+      ? "manual"
+      : "stopped";
+
+  return {
+    desiredState,
+    serviceStates: Object.keys(nextServiceStates).length > 0 ? nextServiceStates : null,
+  };
+}
+
+function selectRuntimeServiceEntries(input: {
+  config: Record<string, unknown>;
+  serviceIndex?: number | null;
+  respectDesiredStates?: boolean;
+  defaultDesiredState?: WorkspaceRuntimeDesiredState | null;
+  serviceStates?: WorkspaceRuntimeServiceStateMap | null;
+}) {
+  const entries = listConfiguredRuntimeServiceEntries(input.config);
+  const states = input.serviceStates ?? readConfiguredServiceStates(input.config);
+  const fallbackState: WorkspaceRuntimeDesiredState = readDesiredRuntimeState(input.defaultDesiredState) ?? "stopped";
+
+  return entries.filter((_, index) => {
+    if (input.serviceIndex !== undefined && input.serviceIndex !== null) {
+      return index === input.serviceIndex;
+    }
+    if (!input.respectDesiredStates) return true;
+    return (states[String(index)] ?? fallbackState) === "running";
+  });
 }
 
 export async function ensureRuntimeServicesForRun(input: {
@@ -1530,7 +3163,12 @@ export async function ensureRuntimeServicesForRun(input: {
   adapterEnv: Record<string, string>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }): Promise<RuntimeServiceRef[]> {
-  const rawServices = readRuntimeServiceEntries(input.config);
+  const rawServices = selectRuntimeServiceEntries({
+    config: input.config,
+    respectDesiredStates: true,
+    defaultDesiredState: readDesiredRuntimeState(input.config.desiredState) ?? "running",
+    serviceStates: readConfiguredServiceStates(input.config),
+  });
   const acquiredServiceIds: string[] = [];
   const refs: RuntimeServiceRef[] = [];
   runtimeServiceLeasesByRun.set(input.runId, acquiredServiceIds);
@@ -1611,8 +3249,16 @@ export async function startRuntimeServicesForWorkspaceControl(input: {
   config: Record<string, unknown>;
   adapterEnv: Record<string, string>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  serviceIndex?: number | null;
+  respectDesiredStates?: boolean;
 }): Promise<RuntimeServiceRef[]> {
-  const rawServices = readRuntimeServiceEntries(input.config);
+  const rawServices = selectRuntimeServiceEntries({
+    config: input.config,
+    serviceIndex: input.serviceIndex,
+    respectDesiredStates: input.respectDesiredStates,
+    defaultDesiredState: readDesiredRuntimeState(input.config.desiredState) ?? "stopped",
+    serviceStates: readConfiguredServiceStates(input.config),
+  });
   const refs: RuntimeServiceRef[] = [];
   const invocationId = input.invocationId ?? randomUUID();
 
@@ -1702,10 +3348,12 @@ export async function stopRuntimeServicesForExecutionWorkspace(input: {
   db?: Db;
   executionWorkspaceId: string;
   workspaceCwd?: string | null;
+  runtimeServiceId?: string | null;
 }) {
   const normalizedWorkspaceCwd = input.workspaceCwd ? path.resolve(input.workspaceCwd) : null;
   const matchingServiceIds = Array.from(runtimeServicesById.values())
     .filter((record) => {
+      if (input.runtimeServiceId) return record.id === input.runtimeServiceId;
       if (record.executionWorkspaceId === input.executionWorkspaceId) return true;
       if (!normalizedWorkspaceCwd || !record.cwd) return false;
       const resolvedCwd = path.resolve(record.cwd);
@@ -1721,19 +3369,37 @@ export async function stopRuntimeServicesForExecutionWorkspace(input: {
   }
 
   if (input.db) {
-    await markPersistedRuntimeServicesStoppedForExecutionWorkspace({
-      db: input.db,
-      executionWorkspaceId: input.executionWorkspaceId,
-    });
+    if (input.runtimeServiceId) {
+      const now = new Date();
+      await input.db
+        .update(workspaceRuntimeServices)
+        .set({
+          status: "stopped",
+          healthStatus: "unknown",
+          stoppedAt: now,
+          lastUsedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(workspaceRuntimeServices.id, input.runtimeServiceId));
+    } else {
+      await markPersistedRuntimeServicesStoppedForExecutionWorkspace({
+        db: input.db,
+        executionWorkspaceId: input.executionWorkspaceId,
+      });
+    }
   }
 }
 
 export async function stopRuntimeServicesForProjectWorkspace(input: {
   db?: Db;
   projectWorkspaceId: string;
+  runtimeServiceId?: string | null;
 }) {
   const matchingServiceIds = Array.from(runtimeServicesById.values())
-    .filter((record) => record.projectWorkspaceId === input.projectWorkspaceId && record.scopeType === "project_workspace")
+    .filter((record) => {
+      if (input.runtimeServiceId) return record.id === input.runtimeServiceId;
+      return record.projectWorkspaceId === input.projectWorkspaceId && record.scopeType === "project_workspace";
+    })
     .map((record) => record.id);
 
   for (const serviceId of matchingServiceIds) {
@@ -1752,11 +3418,13 @@ export async function stopRuntimeServicesForProjectWorkspace(input: {
         updatedAt: now,
       })
       .where(
-        and(
-          eq(workspaceRuntimeServices.projectWorkspaceId, input.projectWorkspaceId),
-          eq(workspaceRuntimeServices.scopeType, "project_workspace"),
-          inArray(workspaceRuntimeServices.status, ["starting", "running"]),
-        ),
+        input.runtimeServiceId
+          ? eq(workspaceRuntimeServices.id, input.runtimeServiceId)
+          : and(
+              eq(workspaceRuntimeServices.projectWorkspaceId, input.projectWorkspaceId),
+              eq(workspaceRuntimeServices.scopeType, "project_workspace"),
+              inArray(workspaceRuntimeServices.status, ["starting", "running"]),
+            ),
       );
   }
 }
@@ -1805,55 +3473,85 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
   let adopted = 0;
   let stopped = 0;
   for (const row of rows) {
-    const adoptedRecord = await findLocalServiceRegistryRecordByRuntimeServiceId({
+    let adoptedRecord = await findLocalServiceRegistryRecordByRuntimeServiceId({
       runtimeServiceId: row.id,
       profileKind: "workspace-runtime",
     });
-    if (adoptedRecord) {
-      const record: RuntimeServiceRecord = {
-        id: row.id,
-        companyId: row.companyId,
-        projectId: row.projectId ?? null,
-        projectWorkspaceId: row.projectWorkspaceId ?? null,
-        executionWorkspaceId: row.executionWorkspaceId ?? null,
-        issueId: row.issueId ?? null,
-        serviceName: row.serviceName,
-        status: "running",
-        lifecycle: row.lifecycle as RuntimeServiceRecord["lifecycle"],
-        scopeType: row.scopeType as RuntimeServiceRecord["scopeType"],
-        scopeId: row.scopeId ?? null,
-        reuseKey: row.reuseKey ?? null,
-        command: row.command ?? null,
-        cwd: row.cwd ?? null,
-        port: adoptedRecord.port ?? row.port ?? null,
-        url: adoptedRecord.url ?? row.url ?? null,
-        provider: "local_process",
-        providerRef: String(adoptedRecord.pid),
-        ownerAgentId: row.ownerAgentId ?? null,
-        startedByRunId: row.startedByRunId ?? null,
-        lastUsedAt: new Date().toISOString(),
-        startedAt: row.startedAt.toISOString(),
-        stoppedAt: null,
-        stopPolicy: (row.stopPolicy as Record<string, unknown> | null) ?? null,
-        healthStatus: "healthy",
-        reused: true,
-        db,
-        child: null,
-        leaseRunIds: new Set(),
-        idleTimer: null,
-        envFingerprint: row.reuseKey ?? "",
-        serviceKey: adoptedRecord.serviceKey,
+    if (!adoptedRecord && row.command && row.cwd) {
+      adoptedRecord = await findAdoptableLocalService({
+        serviceKey: createLocalServiceKey({
+          profileKind: "workspace-runtime",
+          serviceName: row.serviceName,
+          cwd: row.cwd,
+          command: row.command,
+          envFingerprint: row.reuseKey ?? "",
+          port: null,
+          scope: {
+            scopeType: row.scopeType as RuntimeServiceRecord["scopeType"],
+            scopeId: row.scopeId ?? null,
+            executionWorkspaceId: row.executionWorkspaceId ?? null,
+            reuseKey: row.reuseKey ?? null,
+          },
+        }),
         profileKind: "workspace-runtime",
-        processGroupId: adoptedRecord.processGroupId ?? null,
-      };
-      registerRuntimeService(db, record);
-      await touchLocalServiceRegistryRecord(adoptedRecord.serviceKey, {
-        runtimeServiceId: row.id,
-        lastSeenAt: record.lastUsedAt,
+        serviceName: row.serviceName,
+        command: row.command,
+        cwd: row.cwd,
+        envFingerprint: row.reuseKey ?? "",
+        port: row.port ?? null,
+        url: row.url ?? null,
       });
-      await persistRuntimeServiceRecord(db, record);
-      adopted += 1;
-      continue;
+    }
+    if (adoptedRecord) {
+      const adoptedUrl = adoptedRecord.url ?? row.url ?? null;
+      if (!(await isRuntimeServiceUrlHealthy(adoptedUrl, { serviceName: row.serviceName, command: row.command }))) {
+        await removeLocalServiceRegistryRecord(adoptedRecord.serviceKey);
+      } else {
+        const record: RuntimeServiceRecord = {
+          id: row.id,
+          companyId: row.companyId,
+          projectId: row.projectId ?? null,
+          projectWorkspaceId: row.projectWorkspaceId ?? null,
+          executionWorkspaceId: row.executionWorkspaceId ?? null,
+          issueId: row.issueId ?? null,
+          serviceName: row.serviceName,
+          status: "running",
+          lifecycle: row.lifecycle as RuntimeServiceRecord["lifecycle"],
+          scopeType: row.scopeType as RuntimeServiceRecord["scopeType"],
+          scopeId: row.scopeId ?? null,
+          reuseKey: row.reuseKey ?? null,
+          command: row.command ?? null,
+          cwd: row.cwd ?? null,
+          port: adoptedRecord.port ?? row.port ?? null,
+          url: adoptedRecord.url ?? row.url ?? null,
+          provider: "local_process",
+          providerRef: String(adoptedRecord.pid),
+          ownerAgentId: row.ownerAgentId ?? null,
+          startedByRunId: row.startedByRunId ?? null,
+          lastUsedAt: new Date().toISOString(),
+          startedAt: row.startedAt.toISOString(),
+          stoppedAt: null,
+          stopPolicy: (row.stopPolicy as Record<string, unknown> | null) ?? null,
+          healthStatus: "healthy",
+          reused: true,
+          db,
+          child: null,
+          leaseRunIds: new Set(),
+          idleTimer: null,
+          envFingerprint: row.reuseKey ?? "",
+          serviceKey: adoptedRecord.serviceKey,
+          profileKind: "workspace-runtime",
+          processGroupId: adoptedRecord.processGroupId ?? null,
+        };
+        registerRuntimeService(db, record);
+        await touchLocalServiceRegistryRecord(adoptedRecord.serviceKey, {
+          runtimeServiceId: row.id,
+          lastSeenAt: record.lastUsedAt,
+        });
+        await persistRuntimeServiceRecord(db, record);
+        adopted += 1;
+        continue;
+      }
     }
 
     const now = new Date();
@@ -1887,6 +3585,7 @@ export async function restartDesiredRuntimeServicesOnStartup(db: Db) {
   const projectWorkspaceRows = await db
     .select()
     .from(projectWorkspaces);
+  const projectWorkspaceRowsById = new Map(projectWorkspaceRows.map((row) => [row.id, row] as const));
 
   for (const row of projectWorkspaceRows) {
     const runtimeConfig = readProjectWorkspaceRuntimeConfig((row.metadata as Record<string, unknown> | null) ?? null);
@@ -1911,8 +3610,13 @@ export async function restartDesiredRuntimeServicesOnStartup(db: Db) {
           warnings: [],
           created: false,
         },
-        config: { workspaceRuntime: runtimeConfig.workspaceRuntime },
+        config: {
+          workspaceRuntime: runtimeConfig.workspaceRuntime,
+          desiredState: runtimeConfig.desiredState,
+          serviceStates: runtimeConfig.serviceStates ?? null,
+        },
         adapterEnv: {},
+        respectDesiredStates: true,
       });
       if (refs.length > 0) restarted += refs.filter((ref) => !ref.reused).length;
     } catch {
@@ -1927,7 +3631,13 @@ export async function restartDesiredRuntimeServicesOnStartup(db: Db) {
 
   for (const row of executionWorkspaceRows) {
     const config = readExecutionWorkspaceConfig((row.metadata as Record<string, unknown> | null) ?? null);
-    if (config?.desiredState !== "running" || !config.workspaceRuntime || !row.cwd) continue;
+    const inheritedRuntimeConfig = row.projectWorkspaceId
+      ? readProjectWorkspaceRuntimeConfig(
+          (projectWorkspaceRowsById.get(row.projectWorkspaceId)?.metadata as Record<string, unknown> | null) ?? null,
+        )?.workspaceRuntime ?? null
+      : null;
+    const effectiveRuntimeConfig = config?.workspaceRuntime ?? inheritedRuntimeConfig;
+    if (config?.desiredState !== "running" || !effectiveRuntimeConfig || !row.cwd) continue;
 
     try {
       const refs = await startRuntimeServicesForWorkspaceControl({
@@ -1955,8 +3665,13 @@ export async function restartDesiredRuntimeServicesOnStartup(db: Db) {
           created: false,
         },
         executionWorkspaceId: row.id,
-        config: { workspaceRuntime: config.workspaceRuntime },
+        config: {
+          workspaceRuntime: effectiveRuntimeConfig,
+          desiredState: config.desiredState,
+          serviceStates: config.serviceStates ?? null,
+        },
         adapterEnv: {},
+        respectDesiredStates: true,
       });
       if (refs.length > 0) restarted += refs.filter((ref) => !ref.reused).length;
     } catch {

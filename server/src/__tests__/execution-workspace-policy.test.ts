@@ -6,6 +6,7 @@ import {
   issueExecutionWorkspaceModeForPersistedWorkspace,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
+  resolveExecutionWorkspaceEnvironmentId,
   resolveExecutionWorkspaceMode,
 } from "../services/execution-workspace-policy.ts";
 
@@ -85,6 +86,23 @@ describe("execution workspace policy helpers", () => {
     });
   });
 
+  it("preserves project authorization policy for trust-preset resolution", () => {
+    expect(parseProjectExecutionWorkspacePolicy({
+      enabled: true,
+      authorizationPolicy: {
+        trustBoundary: {
+          mode: "low_trust_review",
+          projectIds: ["33333333-3333-4333-8333-333333333333"],
+        },
+      },
+    })?.authorizationPolicy).toEqual({
+      trustBoundary: {
+        mode: "low_trust_review",
+        projectIds: ["33333333-3333-4333-8333-333333333333"],
+      },
+    });
+  });
+
   it("clears managed workspace strategy when issue opts out to project primary or agent default", () => {
     const baseConfig = {
       workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}" },
@@ -140,6 +158,45 @@ describe("execution workspace policy helpers", () => {
       }),
     ).toEqual({
       mode: "shared_workspace",
+    });
+  });
+
+  it("prefers the agent default environment", () => {
+    expect(
+      resolveExecutionWorkspaceEnvironmentId({
+        agentDefaultEnvironmentId: "agent-env",
+        instanceDefaultEnvironmentId: "instance-env",
+        localDefaultEnvironmentId: "local-env",
+      }),
+    ).toEqual({
+      environmentId: "agent-env",
+      source: "agent",
+    });
+  });
+
+  it("falls back to the instance default environment when the agent has none", () => {
+    expect(
+      resolveExecutionWorkspaceEnvironmentId({
+        agentDefaultEnvironmentId: null,
+        instanceDefaultEnvironmentId: "instance-env",
+        localDefaultEnvironmentId: "local-env",
+      }),
+    ).toEqual({
+      environmentId: "instance-env",
+      source: "instance",
+    });
+  });
+
+  it("falls back to the built-in local environment when neither agent nor instance selects one", () => {
+    expect(
+      resolveExecutionWorkspaceEnvironmentId({
+        agentDefaultEnvironmentId: null,
+        instanceDefaultEnvironmentId: null,
+        localDefaultEnvironmentId: "local-env",
+      }),
+    ).toEqual({
+      environmentId: "local-env",
+      source: "default",
     });
   });
 

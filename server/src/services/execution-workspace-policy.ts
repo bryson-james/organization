@@ -74,6 +74,9 @@ export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecu
     ...(parsed.cleanupPolicy && typeof parsed.cleanupPolicy === "object" && !Array.isArray(parsed.cleanupPolicy)
       ? { cleanupPolicy: { ...(parsed.cleanupPolicy as Record<string, unknown>) } }
       : {}),
+    ...(parsed.authorizationPolicy && typeof parsed.authorizationPolicy === "object" && !Array.isArray(parsed.authorizationPolicy)
+      ? { authorizationPolicy: { ...(parsed.authorizationPolicy as Record<string, unknown>) } }
+      : {}),
   };
 }
 
@@ -113,6 +116,39 @@ export function parseIssueExecutionWorkspaceSettings(raw: unknown): IssueExecuti
     ...(parsed.workspaceRuntime && typeof parsed.workspaceRuntime === "object" && !Array.isArray(parsed.workspaceRuntime)
       ? { workspaceRuntime: { ...(parsed.workspaceRuntime as Record<string, unknown>) } }
       : {}),
+  };
+}
+
+export type ExecutionWorkspaceEnvironmentSource =
+  | "agent"
+  | "instance"
+  | "default";
+
+export type ExecutionWorkspaceEnvironmentResolution = {
+  environmentId: string;
+  source: ExecutionWorkspaceEnvironmentSource;
+};
+
+export function resolveExecutionWorkspaceEnvironmentId(input: {
+  agentDefaultEnvironmentId: string | null;
+  instanceDefaultEnvironmentId: string | null;
+  localDefaultEnvironmentId: string;
+}): ExecutionWorkspaceEnvironmentResolution {
+  if (input.agentDefaultEnvironmentId) {
+    return {
+      environmentId: input.agentDefaultEnvironmentId,
+      source: "agent",
+    };
+  }
+  if (input.instanceDefaultEnvironmentId) {
+    return {
+      environmentId: input.instanceDefaultEnvironmentId,
+      source: "instance",
+    };
+  }
+  return {
+    environmentId: input.localDefaultEnvironmentId,
+    source: "default",
   };
 }
 

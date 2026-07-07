@@ -5,6 +5,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { inArray } from "drizzle-orm";
 import {
   companies,
   createDb,
@@ -12,6 +13,7 @@ import {
   issues,
   projectWorkspaces,
   projects,
+  workspaceRuntimeServices,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -30,6 +32,7 @@ describe("execution workspace config helpers", () => {
     expect(readExecutionWorkspaceConfig({
       source: "project_primary",
       config: {
+        environmentId: "32e0464c-2a0b-4ce9-886d-2cc99e6f3e7b",
         provisionCommand: "bash ./scripts/provision-worktree.sh",
         teardownCommand: "bash ./scripts/teardown-worktree.sh",
         cleanupCommand: "pkill -f vite || true",
@@ -38,10 +41,12 @@ describe("execution workspace config helpers", () => {
         },
       },
     })).toEqual({
+      environmentId: "32e0464c-2a0b-4ce9-886d-2cc99e6f3e7b",
       provisionCommand: "bash ./scripts/provision-worktree.sh",
       teardownCommand: "bash ./scripts/teardown-worktree.sh",
       cleanupCommand: "pkill -f vite || true",
       desiredState: null,
+      serviceStates: null,
       workspaceRuntime: {
         services: [{ name: "web", command: "pnpm dev", port: 3100 }],
       },
@@ -54,11 +59,13 @@ describe("execution workspace config helpers", () => {
         source: "project_primary",
         createdByRuntime: false,
         config: {
+          environmentId: "32e0464c-2a0b-4ce9-886d-2cc99e6f3e7b",
           provisionCommand: "bash ./scripts/provision-worktree.sh",
           cleanupCommand: "pkill -f vite || true",
         },
       },
       {
+        environmentId: "6286d5a9-9ea7-42b9-98b3-18ee904c26d7",
         teardownCommand: "bash ./scripts/teardown-worktree.sh",
         workspaceRuntime: {
           services: [{ name: "web", command: "pnpm dev" }],
@@ -68,14 +75,32 @@ describe("execution workspace config helpers", () => {
       source: "project_primary",
       createdByRuntime: false,
       config: {
+        environmentId: "6286d5a9-9ea7-42b9-98b3-18ee904c26d7",
         provisionCommand: "bash ./scripts/provision-worktree.sh",
         teardownCommand: "bash ./scripts/teardown-worktree.sh",
         cleanupCommand: "pkill -f vite || true",
         desiredState: null,
+        serviceStates: null,
         workspaceRuntime: {
           services: [{ name: "web", command: "pnpm dev" }],
         },
       },
+    });
+  });
+
+  it("clears a persisted environment selection when patching it to null", () => {
+    expect(mergeExecutionWorkspaceConfig(
+      {
+        source: "project_primary",
+        config: {
+          environmentId: "32e0464c-2a0b-4ce9-886d-2cc99e6f3e7b",
+        },
+      },
+      {
+        environmentId: null,
+      },
+    )).toEqual({
+      source: "project_primary",
     });
   });
 
@@ -132,6 +157,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(workspaceRuntimeServices);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
@@ -219,6 +245,489 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       "This workspace is still linked to an open issue. Archiving it will detach this shared workspace session from those issues, but keep the underlying project workspace available.",
       "This shared workspace session points at project workspace infrastructure. Archiving it only removes the session record.",
     ]));
+  });
+
+  it("clears matching environment selections transactionally without touching other workspaces", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const matchingWorkspaceId = randomUUID();
+    const otherWorkspaceId = randomUUID();
+    const untouchedWorkspaceId = randomUUID();
+    const environmentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace cleanup",
+      status: "in_progress",
+      executionWorkspacePolicy: {
+        enabled: true,
+      },
+    });
+    await db.insert(executionWorkspaces).values([
+      {
+        id: matchingWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "directory",
+        name: "Matching workspace",
+        status: "active",
+        providerType: "local_fs",
+        cwd: "/tmp/workspace-a",
+        metadata: {
+          source: "manual",
+          config: {
+            environmentId,
+            cleanupCommand: "echo clean",
+          },
+        },
+      },
+      {
+        id: otherWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "directory",
+        name: "Different environment",
+        status: "active",
+        providerType: "local_fs",
+        cwd: "/tmp/workspace-b",
+        metadata: {
+          source: "manual",
+          config: {
+            environmentId: randomUUID(),
+          },
+        },
+      },
+      {
+        id: untouchedWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "directory",
+        name: "No environment",
+        status: "active",
+        providerType: "local_fs",
+        cwd: "/tmp/workspace-c",
+        metadata: {
+          source: "manual",
+        },
+      },
+    ]);
+
+    const cleared = await svc.clearEnvironmentSelection(companyId, environmentId);
+
+    expect(cleared).toBe(1);
+
+    const rows = await db
+      .select({
+        id: executionWorkspaces.id,
+        metadata: executionWorkspaces.metadata,
+      })
+      .from(executionWorkspaces)
+      .where(inArray(executionWorkspaces.id, [matchingWorkspaceId, otherWorkspaceId, untouchedWorkspaceId]));
+
+    const byId = new Map(rows.map((row) => [row.id, row.metadata as Record<string, unknown> | null]));
+    expect(readExecutionWorkspaceConfig(byId.get(matchingWorkspaceId) ?? null)).toMatchObject({
+      environmentId: null,
+      cleanupCommand: "echo clean",
+    });
+    expect(readExecutionWorkspaceConfig(byId.get(otherWorkspaceId) ?? null)).toMatchObject({
+      environmentId: expect.any(String),
+    });
+    expect(readExecutionWorkspaceConfig(byId.get(untouchedWorkspaceId) ?? null)).toBeNull();
+  });
+
+  it("limits reusable summaries to open non-shared execution workspaces", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const openWorkspaceId = randomUUID();
+    const sharedWorkspaceId = randomUUID();
+    const closedWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Reusable workspaces",
+      status: "in_progress",
+      executionWorkspacePolicy: {
+        enabled: true,
+      },
+    });
+    await db.insert(executionWorkspaces).values([
+      {
+        id: openWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Open isolated workspace",
+        status: "idle",
+        providerType: "git_worktree",
+        cwd: "/tmp/open-workspace",
+        branchName: "paperclip/open",
+      },
+      {
+        id: sharedWorkspaceId,
+        companyId,
+        projectId,
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        name: "Shared session",
+        status: "active",
+        providerType: "local_fs",
+        cwd: "/tmp/project-primary",
+      },
+      {
+        id: closedWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Closed isolated workspace",
+        status: "active",
+        providerType: "git_worktree",
+        cwd: "/tmp/closed-workspace",
+        closedAt: new Date("2026-05-23T20:00:00.000Z"),
+      },
+    ]);
+
+    const summaries = await svc.listSummaries(companyId, {
+      projectId,
+      reuseEligible: true,
+    });
+
+    expect(summaries).toEqual([
+      expect.objectContaining({
+        id: openWorkspaceId,
+        name: "Open isolated workspace",
+        mode: "isolated_workspace",
+        status: "idle",
+        cwd: "/tmp/open-workspace",
+        branchName: "paperclip/open",
+      }),
+    ]);
+  });
+
+  it("returns a bounded company-scoped workspace overview with service and linked issue summaries", async () => {
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const projectId = randomUUID();
+    const workspaceAId = "11111111-1111-4111-8111-111111111111";
+    const workspaceBId = "22222222-2222-4222-8222-222222222222";
+    const archivedWorkspaceId = "33333333-3333-4333-8333-333333333333";
+    const otherWorkspaceId = "44444444-4444-4444-8444-444444444444";
+    const crossCompanyProjectWorkspaceId = "55555555-5555-4555-8555-555555555555";
+
+    await db.insert(companies).values([
+      {
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: "PAP",
+        requireBoardApprovalForNewAgents: false,
+      },
+      {
+        id: otherCompanyId,
+        name: "OtherCo",
+        issuePrefix: "OTH",
+        requireBoardApprovalForNewAgents: false,
+      },
+    ]);
+    await db.insert(projects).values([
+      {
+        id: projectId,
+        companyId,
+        name: "Workspaces",
+        status: "in_progress",
+        executionWorkspacePolicy: {
+          enabled: true,
+        },
+      },
+      {
+        id: randomUUID(),
+        companyId: otherCompanyId,
+        name: "Other project",
+        status: "in_progress",
+      },
+    ]);
+    const otherProject = await db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(inArray(projects.companyId, [otherCompanyId]))
+      .then((rows) => rows[0]!.id);
+
+    await db.insert(executionWorkspaces).values([
+      {
+        id: workspaceAId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Active A",
+        status: "active",
+        providerType: "git_worktree",
+        cwd: "/tmp/workspace-a",
+        branchName: "paperclip/a",
+        lastUsedAt: new Date("2026-06-03T10:00:00.000Z"),
+        updatedAt: new Date("2026-06-03T10:05:00.000Z"),
+        metadata: {
+          config: {
+            workspaceRuntime: {
+              services: [{ name: "web", command: "pnpm dev" }],
+            },
+          },
+        },
+      },
+      {
+        id: workspaceBId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Active B",
+        status: "idle",
+        providerType: "git_worktree",
+        cwd: "/tmp/workspace-b",
+        branchName: "paperclip/b",
+        lastUsedAt: new Date("2026-06-02T10:00:00.000Z"),
+        updatedAt: new Date("2026-06-02T10:05:00.000Z"),
+      },
+      {
+        id: archivedWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Archived",
+        status: "archived",
+        providerType: "git_worktree",
+        cwd: "/tmp/workspace-archived",
+        lastUsedAt: new Date("2026-06-04T10:00:00.000Z"),
+      },
+      {
+        id: otherWorkspaceId,
+        companyId: otherCompanyId,
+        projectId: otherProject,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Other company",
+        status: "active",
+        providerType: "git_worktree",
+        cwd: "/tmp/workspace-other",
+        lastUsedAt: new Date("2026-06-05T10:00:00.000Z"),
+      },
+      {
+        id: crossCompanyProjectWorkspaceId,
+        companyId,
+        projectId: otherProject,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Cross-company project mismatch",
+        status: "active",
+        providerType: "git_worktree",
+        cwd: "/tmp/workspace-cross-company-project",
+        lastUsedAt: new Date("2026-06-06T10:00:00.000Z"),
+      },
+    ]);
+    await db.insert(workspaceRuntimeServices).values([
+      {
+        id: randomUUID(),
+        companyId,
+        projectId,
+        executionWorkspaceId: workspaceAId,
+        issueId: null,
+        scopeType: "execution_workspace",
+        serviceName: "web",
+        status: "running",
+        lifecycle: "shared",
+        command: "pnpm dev",
+        cwd: "/tmp/workspace-a",
+        port: 3100,
+        url: "http://localhost:3100",
+        provider: "local_process",
+        healthStatus: "healthy",
+        updatedAt: new Date("2026-06-03T10:06:00.000Z"),
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        projectId,
+        executionWorkspaceId: workspaceAId,
+        issueId: null,
+        scopeType: "execution_workspace",
+        serviceName: "worker",
+        status: "stopped",
+        lifecycle: "shared",
+        command: "pnpm worker",
+        cwd: "/tmp/workspace-a",
+        provider: "local_process",
+        healthStatus: "unknown",
+      },
+    ]);
+    await db.insert(issues).values(
+      Array.from({ length: 5 }, (_, index) => ({
+        id: randomUUID(),
+        companyId,
+        projectId,
+        title: `Linked issue ${index + 1}`,
+        status: "todo",
+        priority: "medium",
+        identifier: `PAP-${index + 1}`,
+        executionWorkspaceId: workspaceAId,
+        updatedAt: new Date(`2026-06-03T09:0${index}:00.000Z`),
+      })),
+    );
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      projectId,
+      title: "Hidden linked issue",
+      status: "todo",
+      priority: "medium",
+      executionWorkspaceId: workspaceAId,
+      hiddenAt: new Date("2026-06-03T11:00:00.000Z"),
+    });
+
+    const overview = await svc.listOverview(companyId, {
+      limit: 10,
+      offset: 0,
+    });
+
+    expect(overview.total).toBe(2);
+    expect(overview.items.map((item) => item.workspaceId)).toEqual([workspaceAId, workspaceBId]);
+    expect(overview.items.map((item) => item.workspaceId)).not.toContain(archivedWorkspaceId);
+    expect(overview.items.map((item) => item.workspaceId)).not.toContain(otherWorkspaceId);
+    expect(overview.items.map((item) => item.workspaceId)).not.toContain(crossCompanyProjectWorkspaceId);
+    expect(overview.hasMore).toBe(false);
+
+    const activeA = overview.items[0]!;
+    expect(activeA).toMatchObject({
+      key: `execution:${workspaceAId}`,
+      kind: "execution_workspace",
+      workspaceName: "Active A",
+      projectId,
+      projectUrlKey: "workspaces",
+      projectName: "Workspaces",
+      branchName: "paperclip/a",
+      serviceCount: 2,
+      runningServiceCount: 1,
+      primaryServiceUrl: "http://localhost:3100",
+      primaryServiceUrlRunning: true,
+      hasRuntimeConfig: true,
+      linkedIssueCount: 5,
+    });
+    expect(activeA.primaryService).toMatchObject({
+      serviceName: "web",
+      status: "running",
+      url: "http://localhost:3100",
+      port: 3100,
+      healthStatus: "healthy",
+    });
+    expect(activeA.linkedIssues).toHaveLength(4);
+    expect(activeA.linkedIssues.map((issue) => issue.title)).toEqual([
+      "Linked issue 5",
+      "Linked issue 4",
+      "Linked issue 3",
+      "Linked issue 2",
+    ]);
+  });
+
+  it("supports status and project filters with stable limit/offset pagination", async () => {
+    const companyId = randomUUID();
+    const projectAId = randomUUID();
+    const projectBId = randomUUID();
+    const activeWorkspaceId = "55555555-5555-4555-8555-555555555555";
+    const idleWorkspaceId = "66666666-6666-4666-8666-666666666666";
+    const archivedWorkspaceId = "77777777-7777-4777-8777-777777777777";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values([
+      {
+        id: projectAId,
+        companyId,
+        name: "Project A",
+        status: "in_progress",
+      },
+      {
+        id: projectBId,
+        companyId,
+        name: "Project B",
+        status: "in_progress",
+      },
+    ]);
+    await db.insert(executionWorkspaces).values([
+      {
+        id: activeWorkspaceId,
+        companyId,
+        projectId: projectAId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Newest active",
+        status: "active",
+        providerType: "git_worktree",
+        lastUsedAt: new Date("2026-06-03T10:00:00.000Z"),
+      },
+      {
+        id: idleWorkspaceId,
+        companyId,
+        projectId: projectAId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Older idle",
+        status: "idle",
+        providerType: "git_worktree",
+        lastUsedAt: new Date("2026-06-02T10:00:00.000Z"),
+      },
+      {
+        id: archivedWorkspaceId,
+        companyId,
+        projectId: projectBId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Archived",
+        status: "archived",
+        providerType: "git_worktree",
+        lastUsedAt: new Date("2026-06-04T10:00:00.000Z"),
+      },
+    ]);
+
+    const secondPage = await svc.listOverview(companyId, {
+      projectId: projectAId,
+      limit: 1,
+      offset: 1,
+    });
+
+    expect(secondPage.total).toBe(2);
+    expect(secondPage.items.map((item) => item.workspaceId)).toEqual([idleWorkspaceId]);
+    expect(secondPage.hasMore).toBe(false);
+    expect(secondPage.nextOffset).toBeNull();
+
+    const archivedOnly = await svc.listOverview(companyId, {
+      status: ["archived"],
+      limit: 10,
+      offset: 0,
+    });
+
+    expect(archivedOnly.total).toBe(1);
+    expect(archivedOnly.items.map((item) => item.workspaceId)).toEqual([archivedWorkspaceId]);
   });
 
   it("warns about dirty and unmerged git worktrees and reports cleanup actions", async () => {

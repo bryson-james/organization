@@ -3,12 +3,19 @@ import { Link } from "@/lib/router";
 import type { Issue, ExecutionWorkspace } from "@paperclipai/shared";
 import { useQuery } from "@tanstack/react-query";
 import { executionWorkspacesApi } from "../api/execution-workspaces";
+import { environmentsApi } from "../api/environments";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
+import {
+  defaultExecutionWorkspaceModeForProject,
+  issueExecutionWorkspaceModeForExistingWorkspace,
+} from "../lib/project-workspace-defaults";
+import { orderReusableExecutionWorkspaces } from "../lib/reusable-execution-workspaces";
 import { cn, projectWorkspaceUrl } from "../lib/utils";
 import { Button } from "@/components/ui/button";
-import { Check, Copy, GitBranch, FolderOpen, Pencil, X } from "lucide-react";
+import { Check, Copy, FileSearch, FolderOpen, FolderSearch, GitBranch, Pencil, X } from "lucide-react";
+import { ReusableExecutionWorkspaceSelect } from "./ReusableExecutionWorkspaceSelect";
 
 /* -------------------------------------------------------------------------- */
 /*  Utility helpers (mirrored from IssueProperties for self-containment)      */
@@ -20,13 +27,12 @@ const EXECUTION_WORKSPACE_OPTIONS = [
   { value: "reuse_existing", label: "Reuse existing workspace" },
 ] as const;
 
-function issueModeForExistingWorkspace(mode: string | null | undefined) {
-  if (mode === "isolated_workspace" || mode === "operator_branch" || mode === "shared_workspace") return mode;
-  if (mode === "adapter_managed" || mode === "cloud_sandbox") return "agent_default";
-  return "shared_workspace";
-}
-
-function shouldPresentExistingWorkspaceSelection(issue: Issue) {
+function shouldPresentExistingWorkspaceSelection(
+  issue: Pick<
+    Issue,
+    "executionWorkspaceId" | "executionWorkspacePreference" | "executionWorkspaceSettings" | "currentExecutionWorkspace"
+  >,
+) {
   const persistedMode =
     issue.currentExecutionWorkspace?.mode
     ?? issue.executionWorkspaceSettings?.mode
@@ -35,13 +41,6 @@ function shouldPresentExistingWorkspaceSelection(issue: Issue) {
     issue.executionWorkspaceId &&
     (persistedMode === "isolated_workspace" || persistedMode === "operator_branch"),
   );
-}
-
-function defaultExecutionWorkspaceModeForProject(project: { executionWorkspacePolicy?: { enabled?: boolean; defaultMode?: string | null } | null } | null | undefined) {
-  const defaultMode = project?.executionWorkspacePolicy?.enabled ? project.executionWorkspacePolicy.defaultMode : null;
-  if (defaultMode === "isolated_workspace" || defaultMode === "operator_branch") return defaultMode;
-  if (defaultMode === "adapter_default") return "agent_default";
-  return "shared_workspace";
 }
 
 /* -------------------------------------------------------------------------- */
@@ -156,27 +155,76 @@ function statusBadge(status: string) {
 /* -------------------------------------------------------------------------- */
 
 interface IssueWorkspaceCardProps {
-  issue: Issue;
-  project: { id: string; executionWorkspacePolicy?: { enabled?: boolean; defaultMode?: string | null; defaultProjectWorkspaceId?: string | null } | null; workspaces?: Array<{ id: string; isPrimary: boolean }> } | null;
+  issue: Omit<
+    Pick<
+      Issue,
+      | "companyId"
+      | "projectId"
+      | "projectWorkspaceId"
+      | "executionWorkspaceId"
+      | "executionWorkspacePreference"
+      | "executionWorkspaceSettings"
+    >,
+    "companyId"
+  > & {
+    companyId: string | null;
+    currentExecutionWorkspace?: ExecutionWorkspace | null;
+  };
+  project: {
+    id: string;
+    executionWorkspacePolicy?: {
+      enabled?: boolean;
+      defaultMode?: string | null;
+      defaultProjectWorkspaceId?: string | null;
+      environmentId?: string | null;
+    } | null;
+    workspaces?: Array<{ id: string; isPrimary: boolean }>;
+  } | null;
   onUpdate: (data: Record<string, unknown>) => void;
+  initialEditing?: boolean;
+  livePreview?: boolean;
+  onDraftChange?: (data: Record<string, unknown>, meta: { canSave: boolean; workspaceBranchName?: string | null }) => void;
+  /** Opens the workspace file browser sheet. When omitted, the browse row is hidden. */
+  onBrowseFiles?: () => void;
+  /** Opens the same browser sheet focused for path entry. */
+  onOpenFileByPath?: () => void;
 }
 
-export function IssueWorkspaceCard({ issue, project, onUpdate }: IssueWorkspaceCardProps) {
+export function IssueWorkspaceCard({
+  issue,
+  project,
+  onUpdate,
+  initialEditing = false,
+  livePreview = false,
+  onDraftChange,
+  onBrowseFiles,
+  onOpenFileByPath,
+}: IssueWorkspaceCardProps) {
   const { selectedCompanyId } = useCompany();
   const companyId = issue.companyId ?? selectedCompanyId;
-  const [editing, setEditing] = useState(false);
+  const [editing, setEditing] = useState(initialEditing);
 
   const { data: experimentalSettings } = useQuery({
     queryKey: queryKeys.instance.experimentalSettings,
     queryFn: () => instanceSettingsApi.getExperimental(),
   });
 
+  const environmentsEnabled = experimentalSettings?.enableEnvironments === true;
   const policyEnabled = experimentalSettings?.enableIsolatedWorkspaces === true
     && Boolean(project?.executionWorkspacePolicy?.enabled);
 
   const workspace = issue.currentExecutionWorkspace as ExecutionWorkspace | null | undefined;
+  const { data: environments } = useQuery({
+    queryKey: queryKeys.environments.list(companyId!),
+    queryFn: () => environmentsApi.list(companyId!),
+    enabled: Boolean(companyId) && environmentsEnabled,
+  });
 
-  const { data: reusableExecutionWorkspaces } = useQuery({
+  const {
+    data: reusableExecutionWorkspaces,
+    isLoading: reusableExecutionWorkspacesLoading,
+    isError: reusableExecutionWorkspacesError,
+  } = useQuery({
     queryKey: queryKeys.executionWorkspaces.list(companyId!, {
       projectId: issue.projectId ?? undefined,
       projectWorkspaceId: issue.projectWorkspaceId ?? undefined,
@@ -191,21 +239,10 @@ export function IssueWorkspaceCard({ issue, project, onUpdate }: IssueWorkspaceC
     enabled: Boolean(companyId) && Boolean(issue.projectId) && editing,
   });
 
-  const deduplicatedReusableWorkspaces = useMemo(() => {
-    const workspaces = reusableExecutionWorkspaces ?? [];
-    const seen = new Map<string, typeof workspaces[number]>();
-    for (const ws of workspaces) {
-      const key = ws.cwd ?? ws.id;
-      const existing = seen.get(key);
-      if (!existing || new Date(ws.lastUsedAt) > new Date(existing.lastUsedAt)) {
-        seen.set(key, ws);
-      }
-    }
-    return Array.from(seen.values());
-  }, [reusableExecutionWorkspaces]);
+  const selectableReusableWorkspaces = reusableExecutionWorkspaces ?? [];
 
   const selectedReusableExecutionWorkspace =
-    deduplicatedReusableWorkspaces.find((w) => w.id === issue.executionWorkspaceId)
+    selectableReusableWorkspaces.find((w) => w.id === issue.executionWorkspaceId)
     ?? workspace
     ?? null;
 
@@ -219,6 +256,20 @@ export function IssueWorkspaceCard({ issue, project, onUpdate }: IssueWorkspaceC
 
   const [draftSelection, setDraftSelection] = useState(currentSelection);
   const [draftExecutionWorkspaceId, setDraftExecutionWorkspaceId] = useState(issue.executionWorkspaceId ?? "");
+  const projectEnvironmentId = environmentsEnabled
+    ? project?.executionWorkspacePolicy?.environmentId ?? null
+    : null;
+  const currentReusableEnvironmentId = selectedReusableExecutionWorkspace?.config?.environmentId ?? null;
+  const currentEnvironmentId = environmentsEnabled
+    ? (
+        (currentSelection === "reuse_existing" && currentReusableEnvironmentId)
+        ?? workspace?.config?.environmentId
+        ?? projectEnvironmentId
+      )
+    : null;
+  const currentEnvironment =
+    environments?.find((environment) => environment.id === currentEnvironmentId)
+    ?? null;
 
   useEffect(() => {
     if (editing) return;
@@ -229,7 +280,7 @@ export function IssueWorkspaceCard({ issue, project, onUpdate }: IssueWorkspaceC
   const activeNonDefaultWorkspace = Boolean(workspace && workspace.mode !== "shared_workspace");
 
   const configuredReusableWorkspace =
-    deduplicatedReusableWorkspaces.find((w) => w.id === draftExecutionWorkspaceId)
+    selectableReusableWorkspaces.find((w) => w.id === draftExecutionWorkspaceId)
     ?? (draftExecutionWorkspaceId === issue.executionWorkspaceId ? selectedReusableExecutionWorkspace : null);
 
   const selectedReusableWorkspaceLink = workspaceDetailLink({
@@ -244,25 +295,42 @@ export function IssueWorkspaceCard({ issue, project, onUpdate }: IssueWorkspaceC
   });
 
   const canSaveWorkspaceConfig = draftSelection !== "reuse_existing" || draftExecutionWorkspaceId.length > 0;
+  const draftWorkspaceBranchName =
+    draftSelection === "reuse_existing" && configuredReusableWorkspace?.mode !== "shared_workspace"
+      ? configuredReusableWorkspace?.branchName ?? null
+      : null;
 
-  const handleSave = useCallback(() => {
-    if (!canSaveWorkspaceConfig) return;
-    onUpdate({
-      executionWorkspacePreference: draftSelection,
-      executionWorkspaceId: draftSelection === "reuse_existing" ? draftExecutionWorkspaceId || null : null,
-      executionWorkspaceSettings: {
-        mode:
-          draftSelection === "reuse_existing"
-            ? issueModeForExistingWorkspace(configuredReusableWorkspace?.mode)
-            : draftSelection,
-      },
-    });
-    setEditing(false);
-  }, [
-    canSaveWorkspaceConfig,
+  const buildWorkspaceDraftUpdate = useCallback(() => ({
+    executionWorkspacePreference: draftSelection,
+    executionWorkspaceId: draftSelection === "reuse_existing" ? draftExecutionWorkspaceId || null : null,
+    executionWorkspaceSettings: {
+      mode:
+        draftSelection === "reuse_existing"
+          ? issueExecutionWorkspaceModeForExistingWorkspace(configuredReusableWorkspace?.mode)
+          : draftSelection,
+      environmentId: null,
+    },
+  }), [
     configuredReusableWorkspace?.mode,
     draftExecutionWorkspaceId,
     draftSelection,
+  ]);
+
+  useEffect(() => {
+    if (!onDraftChange) return;
+    onDraftChange(buildWorkspaceDraftUpdate(), {
+      canSave: canSaveWorkspaceConfig,
+      workspaceBranchName: draftWorkspaceBranchName,
+    });
+  }, [buildWorkspaceDraftUpdate, canSaveWorkspaceConfig, draftWorkspaceBranchName, onDraftChange]);
+
+  const handleSave = useCallback(() => {
+    if (!canSaveWorkspaceConfig) return;
+    onUpdate(buildWorkspaceDraftUpdate());
+    setEditing(false);
+  }, [
+    buildWorkspaceDraftUpdate,
+    canSaveWorkspaceConfig,
     onUpdate,
   ]);
 
@@ -273,6 +341,8 @@ export function IssueWorkspaceCard({ issue, project, onUpdate }: IssueWorkspaceC
   }, [currentSelection, issue.executionWorkspaceId]);
 
   if (!policyEnabled || !project) return null;
+
+  const showEditingControls = livePreview || editing;
 
   return (
     <div className="rounded-lg border border-border p-3 space-y-2">
@@ -286,7 +356,7 @@ export function IssueWorkspaceCard({ issue, project, onUpdate }: IssueWorkspaceC
           {workspace ? statusBadge(workspace.status) : statusBadge("idle")}
         </div>
         <div className="flex items-center gap-1">
-          {editing ? (
+          {showEditingControls ? (
             <>
               <Button
                 variant="ghost"
@@ -319,7 +389,7 @@ export function IssueWorkspaceCard({ issue, project, onUpdate }: IssueWorkspaceC
       </div>
 
       {/* Read-only info */}
-      {!editing && (
+      {!showEditingControls && (
         <div className="space-y-1.5 text-xs">
           {workspace?.branchName && (
             <div className="flex items-center gap-1.5">
@@ -339,13 +409,23 @@ export function IssueWorkspaceCard({ issue, project, onUpdate }: IssueWorkspaceC
               <CopyableInline value={workspace.repoUrl} mono />
             </div>
           )}
+          {environmentsEnabled && currentEnvironmentId && (
+            <div className="text-muted-foreground" style={{ overflowWrap: "anywhere" }}>
+              Environment: <span className="text-foreground">{currentEnvironment?.name ?? currentEnvironmentId}</span>
+              {currentSelection === "reuse_existing" && currentReusableEnvironmentId === currentEnvironmentId
+                ? " · reused workspace"
+                : !issue.executionWorkspaceSettings?.environmentId && projectEnvironmentId === currentEnvironmentId
+                ? " · project default"
+                : null}
+            </div>
+          )}
           {!workspace && (
             <div className="text-muted-foreground">
               {currentSelection === "isolated_workspace"
-                ? "A fresh isolated workspace will be created when this issue runs."
+                ? "A fresh isolated workspace will be created when this task runs."
                 : currentSelection === "reuse_existing"
-                  ? "This issue will reuse an existing workspace when it runs."
-                  : "This issue will use the project default workspace configuration when it runs."}
+                  ? "This task will reuse an existing workspace when it runs."
+                  : "This task will use the project default workspace configuration when it runs."}
             </div>
           )}
           {currentSelection === "reuse_existing" && selectedReusableExecutionWorkspace && (
@@ -402,20 +482,13 @@ export function IssueWorkspaceCard({ issue, project, onUpdate }: IssueWorkspaceC
           </select>
 
           {draftSelection === "reuse_existing" && (
-            <select
-              className="w-full rounded border border-border bg-transparent px-2 py-1.5 text-xs outline-none"
+            <ReusableExecutionWorkspaceSelect
               value={draftExecutionWorkspaceId}
-              onChange={(e) => {
-                setDraftExecutionWorkspaceId(e.target.value);
-              }}
-            >
-              <option value="">Choose an existing workspace</option>
-              {deduplicatedReusableWorkspaces.map((w) => (
-                <option key={w.id} value={w.id}>
-                  {w.name} · {w.status} · {w.branchName ?? w.cwd ?? w.id.slice(0, 8)}
-                </option>
-              ))}
-            </select>
+              workspaces={selectableReusableWorkspaces}
+              onValueChange={(workspaceId) => setDraftExecutionWorkspaceId(workspaceId)}
+              loading={reusableExecutionWorkspacesLoading}
+              error={reusableExecutionWorkspacesError}
+            />
           )}
 
           {/* Current workspace summary when editing */}
@@ -438,6 +511,28 @@ export function IssueWorkspaceCard({ issue, project, onUpdate }: IssueWorkspaceC
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Workspace file discovery — calm row under the workspace identity. */}
+      {!showEditingControls && onBrowseFiles && (
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-border/50 pt-2 text-xs">
+          <button
+            type="button"
+            onClick={onBrowseFiles}
+            className="inline-flex items-center gap-1.5 text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <FolderSearch className="h-3.5 w-3.5 shrink-0" />
+            Browse files…
+          </button>
+          <button
+            type="button"
+            onClick={onOpenFileByPath ?? onBrowseFiles}
+            className="inline-flex items-center gap-1.5 text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <FileSearch className="h-3.5 w-3.5 shrink-0" />
+            Open file by path…
+          </button>
         </div>
       )}
     </div>

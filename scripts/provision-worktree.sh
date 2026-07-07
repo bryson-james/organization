@@ -32,17 +32,130 @@ source_env_path="$(dirname "$source_config_path")/.env"
 mkdir -p "$paperclip_dir"
 
 run_isolated_worktree_init() {
+  local base_cli_runner="$base_cwd/cli/node_modules/tsx/dist/cli.mjs"
+  local base_cli_entry="$base_cwd/cli/src/index.ts"
+
+  if [[ -f "$base_cli_runner" && -f "$base_cli_entry" ]]; then
+    (
+      cd "$worktree_cwd"
+      node "$base_cli_runner" "$base_cli_entry" worktree init --force --seed-mode minimal --name "$worktree_name" --from-config "$source_config_path"
+    )
+    return 0
+  fi
+
   if command -v pnpm >/dev/null 2>&1 && pnpm paperclipai --help >/dev/null 2>&1; then
-    pnpm paperclipai worktree init --force --seed-mode minimal --name "$worktree_name" --from-config "$source_config_path"
+    (
+      cd "$worktree_cwd"
+      pnpm paperclipai worktree init --force --seed-mode minimal --name "$worktree_name" --from-config "$source_config_path"
+    )
     return 0
   fi
 
   if command -v paperclipai >/dev/null 2>&1; then
-    paperclipai worktree init --force --seed-mode minimal --name "$worktree_name" --from-config "$source_config_path"
+    (
+      cd "$worktree_cwd"
+      paperclipai worktree init --force --seed-mode minimal --name "$worktree_name" --from-config "$source_config_path"
+    )
+    return 0
+  fi
+
+  return 127
+}
+
+paperclipai_command_available() {
+  if command -v pnpm >/dev/null 2>&1 && pnpm paperclipai --help >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local base_cli_tsx_path="$base_cwd/cli/node_modules/tsx/dist/cli.mjs"
+  local base_cli_entry_path="$base_cwd/cli/src/index.ts"
+  if command -v node >/dev/null 2>&1 && [[ -f "$base_cli_tsx_path" ]] && [[ -f "$base_cli_entry_path" ]]; then
+    return 0
+  fi
+
+  if command -v paperclipai >/dev/null 2>&1; then
     return 0
   fi
 
   return 1
+}
+
+existing_worktree_config_is_usable() {
+  WORKTREE_CONFIG_PATH="$worktree_config_path" \
+  WORKTREE_ENV_PATH="$worktree_env_path" \
+  node <<'EOF'
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+function expandHomePrefix(value) {
+  if (!value) return value;
+  if (value === "~") return os.homedir();
+  if (value.startsWith("~/")) return path.resolve(os.homedir(), value.slice(2));
+  return value;
+}
+
+function parseEnvFile(contents) {
+  const entries = {};
+  for (const rawLine of contents.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = rawLine.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+    if (!match) continue;
+    const [, key, rawValue] = match;
+    const value = rawValue.trim();
+    if (
+      (value.startsWith("\"") && value.endsWith("\"")) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      entries[key] = value.slice(1, -1);
+      continue;
+    }
+    entries[key] = value.replace(/\s+#.*$/, "").trim();
+  }
+  return entries;
+}
+
+function fail(reason) {
+  console.error(reason);
+  process.exit(1);
+}
+
+const configPath = path.resolve(process.env.WORKTREE_CONFIG_PATH);
+const envPath = path.resolve(process.env.WORKTREE_ENV_PATH);
+const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+const env = parseEnvFile(fs.readFileSync(envPath, "utf8"));
+const envConfigPath = expandHomePrefix(env.PAPERCLIP_CONFIG);
+if (envConfigPath && path.resolve(envConfigPath) !== configPath) {
+  fail(`existing worktree env points at ${envConfigPath}, not ${configPath}`);
+}
+
+const homeDir = expandHomePrefix(env.PAPERCLIP_HOME);
+const instanceId = env.PAPERCLIP_INSTANCE_ID;
+if (!homeDir || !instanceId) {
+  fail("existing worktree env is missing PAPERCLIP_HOME or PAPERCLIP_INSTANCE_ID");
+}
+if (!fs.existsSync(homeDir)) {
+  fail(`existing worktree home does not exist on this host: ${homeDir}`);
+}
+
+const instanceRoot = path.resolve(homeDir, "instances", instanceId);
+const runtimePaths = [
+  config.database?.embeddedPostgresDataDir,
+  config.database?.backup?.dir,
+  config.logging?.logDir,
+  config.storage?.localDisk?.baseDir,
+  config.secrets?.localEncrypted?.keyFilePath,
+].filter((value) => typeof value === "string" && value.length > 0);
+
+for (const rawValue of runtimePaths) {
+  const resolved = path.resolve(expandHomePrefix(rawValue));
+  const relative = path.relative(instanceRoot, resolved);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    fail(`existing worktree config path is outside ${instanceRoot}: ${resolved}`);
+  }
+}
+EOF
 }
 
 write_fallback_worktree_config() {
@@ -216,6 +329,8 @@ async function main() {
     server: {
       deploymentMode: sourceConfig?.server?.deploymentMode ?? "local_trusted",
       exposure: sourceConfig?.server?.exposure ?? "private",
+      ...(sourceConfig?.server?.bind ? { bind: sourceConfig.server.bind } : {}),
+      ...(sourceConfig?.server?.customBindHost ? { customBindHost: sourceConfig.server.customBindHost } : {}),
       host: sourceConfig?.server?.host ?? "127.0.0.1",
       port: serverPort,
       allowedHostnames: sourceConfig?.server?.allowedHostnames ?? [],
@@ -295,9 +410,186 @@ main().catch((error) => {
 EOF
 }
 
-if ! run_isolated_worktree_init; then
-  echo "paperclipai CLI not available in this workspace; writing isolated fallback config without DB seeding." >&2
-  write_fallback_worktree_config
+if [[ -e "$worktree_config_path" && -e "$worktree_env_path" ]] && existing_worktree_config_is_usable; then
+  echo "Reusing existing isolated Paperclip worktree config at $worktree_config_path" >&2
+else
+  if [[ -e "$worktree_config_path" || -e "$worktree_env_path" ]]; then
+    echo "Existing isolated Paperclip worktree config is stale for this host; regenerating." >&2
+  fi
+  if paperclipai_command_available; then
+    run_isolated_worktree_init
+  else
+    echo "paperclipai CLI not available in this workspace; writing isolated fallback config without DB seeding." >&2
+    write_fallback_worktree_config
+  fi
+fi
+
+list_base_node_modules_paths() {
+  cd "$base_cwd" &&
+    find . \
+      -mindepth 1 \
+      -maxdepth 4 \
+      -type d \
+      -name node_modules \
+      ! -path './.git/*' \
+      ! -path './.paperclip/*' \
+      | sed 's#^\./##'
+}
+
+compute_pnpm_install_fingerprint() {
+  WORKTREE_CWD="$worktree_cwd" node <<'EOF'
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const root = process.env.WORKTREE_CWD;
+const ignoredDirs = new Set([".git", ".paperclip", "node_modules", "dist", "storybook-static"]);
+const files = [];
+
+function walk(dir) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (ignoredDirs.has(entry.name)) continue;
+
+    const absolutePath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      walk(absolutePath);
+      continue;
+    }
+
+    if (
+      entry.isFile()
+      && (entry.name === "package.json" || entry.name === "pnpm-lock.yaml" || entry.name === "pnpm-workspace.yaml")
+    ) {
+      files.push(absolutePath);
+    }
+  }
+}
+
+walk(root);
+files.sort((left, right) => path.relative(root, left).localeCompare(path.relative(root, right)));
+
+const hash = crypto.createHash("sha256");
+for (const file of files) {
+  const relativePath = path.relative(root, file).replaceAll(path.sep, "/");
+  hash.update(relativePath);
+  hash.update("\0");
+  hash.update(fs.readFileSync(file));
+  hash.update("\0");
+}
+
+process.stdout.write(hash.digest("hex"));
+EOF
+}
+
+if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; then
+  needs_install=0
+  install_fingerprint_path="$paperclip_dir/pnpm-install-fingerprint"
+  current_install_fingerprint="$(compute_pnpm_install_fingerprint)"
+  previous_install_fingerprint=""
+  if [[ -f "$install_fingerprint_path" ]]; then
+    previous_install_fingerprint="$(cat "$install_fingerprint_path")"
+  fi
+
+  while IFS= read -r relative_path; do
+    [[ -n "$relative_path" ]] || continue
+    target_path="$worktree_cwd/$relative_path"
+
+    if [[ -L "$target_path" || ! -e "$target_path" ]]; then
+      needs_install=1
+      break
+    fi
+  done < <(list_base_node_modules_paths)
+
+  if [[ "$needs_install" -eq 0 && "$current_install_fingerprint" != "$previous_install_fingerprint" ]]; then
+    needs_install=1
+  fi
+
+  if [[ "$needs_install" -eq 1 ]]; then
+    backup_suffix=".paperclip-backup-${BASHPID:-$$}"
+    moved_symlink_paths=()
+
+    while IFS= read -r relative_path; do
+      [[ -n "$relative_path" ]] || continue
+      target_path="$worktree_cwd/$relative_path"
+      if [[ -L "$target_path" ]]; then
+        backup_path="${target_path}${backup_suffix}"
+        rm -rf "$backup_path"
+        mv "$target_path" "$backup_path"
+        moved_symlink_paths+=("$relative_path")
+      fi
+    done < <(list_base_node_modules_paths)
+
+    restore_moved_symlinks() {
+      local relative_path target_path backup_path
+      [[ ${#moved_symlink_paths[@]} -gt 0 ]] || return 0
+      for relative_path in "${moved_symlink_paths[@]}"; do
+        target_path="$worktree_cwd/$relative_path"
+        backup_path="${target_path}${backup_suffix}"
+        [[ -L "$backup_path" ]] || continue
+        rm -rf "$target_path"
+        mv "$backup_path" "$target_path"
+      done
+    }
+
+    cleanup_moved_symlinks() {
+      local relative_path target_path backup_path
+      [[ ${#moved_symlink_paths[@]} -gt 0 ]] || return 0
+      for relative_path in "${moved_symlink_paths[@]}"; do
+        target_path="$worktree_cwd/$relative_path"
+        backup_path="${target_path}${backup_suffix}"
+        [[ -L "$backup_path" ]] && rm "$backup_path"
+      done
+    }
+
+    run_pnpm_install() {
+      local stdout_path stderr_path
+      stdout_path="$(mktemp)"
+      stderr_path="$(mktemp)"
+
+      if (
+        cd "$worktree_cwd"
+        pnpm install --prod=false "$@"
+      ) >"$stdout_path" 2>"$stderr_path"; then
+        cat "$stdout_path"
+        cat "$stderr_path" >&2
+        rm -f "$stdout_path" "$stderr_path"
+        return 0
+      fi
+
+      local exit_code=$?
+      cat "$stdout_path"
+      cat "$stderr_path" >&2
+      if grep -q "ERR_PNPM_OUTDATED_LOCKFILE" "$stdout_path" "$stderr_path"; then
+        rm -f "$stdout_path" "$stderr_path"
+        return 90
+      fi
+
+      rm -f "$stdout_path" "$stderr_path"
+      return "$exit_code"
+    }
+
+    if run_pnpm_install --frozen-lockfile; then
+      :
+    else
+      install_exit_code=$?
+      if [[ "$install_exit_code" -eq 90 ]]; then
+        echo "pnpm-lock.yaml is out of date in this execution workspace; retrying install without --frozen-lockfile." >&2
+        run_pnpm_install --no-frozen-lockfile || {
+          restore_moved_symlinks
+          exit 1
+        }
+      else
+        restore_moved_symlinks
+        exit "$install_exit_code"
+      fi
+    fi
+
+    cleanup_moved_symlinks
+    current_install_fingerprint="$(compute_pnpm_install_fingerprint)"
+    printf '%s\n' "$current_install_fingerprint" >"$install_fingerprint_path"
+  fi
+
+  exit 0
 fi
 
 while IFS= read -r relative_path; do
@@ -311,13 +603,5 @@ while IFS= read -r relative_path; do
   mkdir -p "$(dirname "$target_path")"
   ln -s "$source_path" "$target_path"
 done < <(
-  cd "$base_cwd" &&
-    find . \
-      -mindepth 1 \
-      -maxdepth 3 \
-      -type d \
-      -name node_modules \
-      ! -path './.git/*' \
-      ! -path './.paperclip/*' \
-      | sed 's#^\./##'
+  list_base_node_modules_paths
 )

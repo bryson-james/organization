@@ -2,18 +2,31 @@ import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issues, projects, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import type {
   ExecutionWorkspace,
+  ExecutionWorkspaceSummary,
   ExecutionWorkspaceCloseAction,
   ExecutionWorkspaceCloseGitReadiness,
   ExecutionWorkspaceCloseReadiness,
   ExecutionWorkspaceConfig,
+  WorkspaceOverviewResponse,
+  WorkspaceOverviewItem,
+  WorkspaceOverviewLinkedIssue,
+  WorkspaceRuntimeDesiredState,
   WorkspaceRuntimeService,
+  WorkspaceOverviewPrimaryService,
+  WorkspaceOverviewQuery,
 } from "@paperclipai/shared";
+import { deriveProjectUrlKey, WORKSPACE_OVERVIEW_LINKED_ISSUE_LIMIT } from "@paperclipai/shared";
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
+import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
+import {
+  listCurrentRuntimeServicesForExecutionWorkspaces,
+  listCurrentRuntimeServicesForProjectWorkspaces,
+} from "./workspace-runtime-read-model.js";
 
 type ExecutionWorkspaceRow = typeof executionWorkspaces.$inferSelect;
 type WorkspaceRuntimeServiceRow = typeof workspaceRuntimeServices.$inferSelect;
@@ -33,6 +46,20 @@ function readNullableString(value: unknown): string | null {
 function cloneRecord(value: unknown): Record<string, unknown> | null {
   if (!isRecord(value)) return null;
   return { ...value };
+}
+
+function readDesiredState(value: unknown): WorkspaceRuntimeDesiredState | null {
+  return value === "running" || value === "stopped" || value === "manual" ? value : null;
+}
+
+function readServiceStates(value: unknown): ExecutionWorkspaceConfig["serviceStates"] {
+  if (!isRecord(value)) return null;
+  const entries = Object.entries(value).filter(([, state]) =>
+    state === "running" || state === "stopped" || state === "manual"
+  );
+  return entries.length > 0
+    ? Object.fromEntries(entries) as ExecutionWorkspaceConfig["serviceStates"]
+    : null;
 }
 
 async function pathExists(value: string | null | undefined) {
@@ -183,11 +210,13 @@ export function readExecutionWorkspaceConfig(metadata: Record<string, unknown> |
   if (!raw) return null;
 
   const config: ExecutionWorkspaceConfig = {
+    environmentId: readNullableString(raw.environmentId),
     provisionCommand: readNullableString(raw.provisionCommand),
     teardownCommand: readNullableString(raw.teardownCommand),
     cleanupCommand: readNullableString(raw.cleanupCommand),
     workspaceRuntime: cloneRecord(raw.workspaceRuntime),
-    desiredState: raw.desiredState === "running" || raw.desiredState === "stopped" ? raw.desiredState : null,
+    desiredState: readDesiredState(raw.desiredState),
+    serviceStates: readServiceStates(raw.serviceStates),
   };
 
   const hasConfig = Object.values(config).some((value) => {
@@ -205,11 +234,13 @@ export function mergeExecutionWorkspaceConfig(
 ): Record<string, unknown> | null {
   const nextMetadata = isRecord(metadata) ? { ...metadata } : {};
   const current = readExecutionWorkspaceConfig(metadata) ?? {
+    environmentId: null,
     provisionCommand: null,
     teardownCommand: null,
     cleanupCommand: null,
     workspaceRuntime: null,
     desiredState: null,
+    serviceStates: null,
   };
 
   if (patch === null) {
@@ -218,16 +249,17 @@ export function mergeExecutionWorkspaceConfig(
   }
 
   const nextConfig: ExecutionWorkspaceConfig = {
+    environmentId: patch.environmentId !== undefined ? readNullableString(patch.environmentId) : current.environmentId,
     provisionCommand: patch.provisionCommand !== undefined ? readNullableString(patch.provisionCommand) : current.provisionCommand,
     teardownCommand: patch.teardownCommand !== undefined ? readNullableString(patch.teardownCommand) : current.teardownCommand,
     cleanupCommand: patch.cleanupCommand !== undefined ? readNullableString(patch.cleanupCommand) : current.cleanupCommand,
     workspaceRuntime: patch.workspaceRuntime !== undefined ? cloneRecord(patch.workspaceRuntime) : current.workspaceRuntime,
     desiredState:
       patch.desiredState !== undefined
-        ? patch.desiredState === "running" || patch.desiredState === "stopped"
-          ? patch.desiredState
-          : null
+        ? readDesiredState(patch.desiredState)
         : current.desiredState,
+    serviceStates:
+      patch.serviceStates !== undefined ? readServiceStates(patch.serviceStates) : current.serviceStates,
   };
 
   const hasConfig = Object.values(nextConfig).some((value) => {
@@ -238,11 +270,13 @@ export function mergeExecutionWorkspaceConfig(
 
   if (hasConfig) {
     nextMetadata.config = {
+      environmentId: nextConfig.environmentId,
       provisionCommand: nextConfig.provisionCommand,
       teardownCommand: nextConfig.teardownCommand,
       cleanupCommand: nextConfig.cleanupCommand,
       workspaceRuntime: nextConfig.workspaceRuntime,
       desiredState: nextConfig.desiredState,
+      serviceStates: nextConfig.serviceStates ?? null,
     };
   } else {
     delete nextMetadata.config;
@@ -317,8 +351,350 @@ function toExecutionWorkspace(
   };
 }
 
-export function executionWorkspaceService(db: Db) {
+function toExecutionWorkspaceSummary(
+  row: Pick<ExecutionWorkspaceRow, "id" | "name" | "mode" | "status" | "cwd" | "branchName" | "projectWorkspaceId" | "lastUsedAt">,
+): ExecutionWorkspaceSummary {
   return {
+    id: row.id,
+    name: row.name,
+    mode: row.mode as ExecutionWorkspaceSummary["mode"],
+    status: row.status as ExecutionWorkspaceSummary["status"],
+    cwd: row.cwd ?? null,
+    branchName: row.branchName ?? null,
+    projectWorkspaceId: row.projectWorkspaceId ?? null,
+    lastUsedAt: row.lastUsedAt,
+  };
+}
+
+function maxDate(...values: Array<Date | string | null | undefined>): Date {
+  let latest = new Date(0);
+  for (const value of values) {
+    if (!value) continue;
+    const date = value instanceof Date ? value : new Date(value);
+    if (!Number.isNaN(date.getTime()) && date.getTime() > latest.getTime()) latest = date;
+  }
+  return latest;
+}
+
+function toWorkspaceOverviewPrimaryService(
+  service: WorkspaceRuntimeService | null,
+): WorkspaceOverviewPrimaryService | null {
+  if (!service) return null;
+  return {
+    id: service.id,
+    serviceName: service.serviceName,
+    status: service.status,
+    url: service.url,
+    port: service.port,
+    healthStatus: service.healthStatus,
+    updatedAt: service.updatedAt,
+  };
+}
+
+function selectPrimaryOverviewService(services: WorkspaceRuntimeService[]) {
+  return services.find((service) => service.status === "running" && service.url)
+    ?? services.find((service) => service.url)
+    ?? services.find((service) => service.status === "running")
+    ?? services[0]
+    ?? null;
+}
+
+function usesInheritedProjectRuntimeServices(row: ExecutionWorkspaceRow) {
+  if (row.mode !== "shared_workspace" || !row.projectWorkspaceId) return false;
+  return !readExecutionWorkspaceConfig((row.metadata as Record<string, unknown> | null) ?? null)?.workspaceRuntime;
+}
+
+async function loadEffectiveRuntimeServicesByExecutionWorkspace(
+  db: Db,
+  companyId: string,
+  rows: ExecutionWorkspaceRow[],
+) {
+  const executionRuntimeServices = await listCurrentRuntimeServicesForExecutionWorkspaces(
+    db,
+    companyId,
+    rows.map((row) => row.id),
+  );
+  const projectWorkspaceIds = rows
+    .filter((row) => usesInheritedProjectRuntimeServices(row))
+    .map((row) => row.projectWorkspaceId)
+    .filter((value): value is string => Boolean(value));
+  const projectRuntimeServices = await listCurrentRuntimeServicesForProjectWorkspaces(
+    db,
+    companyId,
+    [...new Set(projectWorkspaceIds)],
+  );
+
+  return new Map(
+    rows.map((row) => [
+      row.id,
+      usesInheritedProjectRuntimeServices(row)
+        ? (projectRuntimeServices.get(row.projectWorkspaceId!) ?? [])
+        : (executionRuntimeServices.get(row.id) ?? []),
+    ]),
+  );
+}
+
+type WorkspaceOverviewPageRow = ExecutionWorkspaceRow & {
+  projectName: string;
+  projectWorkspaceMetadata: Record<string, unknown> | null;
+};
+
+type WorkspaceOverviewIssueRow = WorkspaceOverviewLinkedIssue & {
+  executionWorkspaceId: string;
+};
+
+export function executionWorkspaceService(db: Db) {
+  function buildListConditions(
+    companyId: string,
+    filters?: {
+      projectId?: string;
+      projectWorkspaceId?: string;
+      issueId?: string;
+      status?: string;
+      reuseEligible?: boolean;
+    },
+  ) {
+    const conditions = [eq(executionWorkspaces.companyId, companyId)];
+    if (filters?.projectId) conditions.push(eq(executionWorkspaces.projectId, filters.projectId));
+    if (filters?.projectWorkspaceId) {
+      conditions.push(eq(executionWorkspaces.projectWorkspaceId, filters.projectWorkspaceId));
+    }
+    if (filters?.issueId) conditions.push(eq(executionWorkspaces.sourceIssueId, filters.issueId));
+    if (filters?.status) {
+      const statuses = filters.status.split(",").map((value) => value.trim()).filter(Boolean);
+      if (statuses.length === 1) conditions.push(eq(executionWorkspaces.status, statuses[0]!));
+      else if (statuses.length > 1) conditions.push(inArray(executionWorkspaces.status, statuses));
+    }
+    if (filters?.reuseEligible) {
+      conditions.push(inArray(executionWorkspaces.status, ["active", "idle", "in_review"]));
+      conditions.push(isNull(executionWorkspaces.closedAt));
+      conditions.push(inArray(executionWorkspaces.mode, ["isolated_workspace", "operator_branch", "adapter_managed", "cloud_sandbox"]));
+    }
+    return conditions;
+  }
+
+  function buildOverviewConditions(companyId: string, filters: WorkspaceOverviewQuery) {
+    const conditions = [eq(executionWorkspaces.companyId, companyId)];
+    if (filters.projectId) conditions.push(eq(executionWorkspaces.projectId, filters.projectId));
+    if (filters.status && filters.status.length > 0) {
+      if (filters.status.length === 1) conditions.push(eq(executionWorkspaces.status, filters.status[0]!));
+      else conditions.push(inArray(executionWorkspaces.status, filters.status));
+    } else {
+      conditions.push(ne(executionWorkspaces.status, "archived"));
+    }
+    return conditions;
+  }
+
+  return {
+    listOverview: async (
+      companyId: string,
+      filters: WorkspaceOverviewQuery,
+    ): Promise<WorkspaceOverviewResponse> => {
+      const conditions = buildOverviewConditions(companyId, filters);
+      const whereClause = and(...conditions);
+
+      const [totalRow, rows] = await Promise.all([
+        db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(executionWorkspaces)
+          .innerJoin(
+            projects,
+            and(
+              eq(projects.id, executionWorkspaces.projectId),
+              eq(projects.companyId, companyId),
+            ),
+          )
+          .where(whereClause)
+          .then((result) => result[0] ?? { count: 0 }),
+        db
+          .select({
+            id: executionWorkspaces.id,
+            companyId: executionWorkspaces.companyId,
+            projectId: executionWorkspaces.projectId,
+            projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
+            sourceIssueId: executionWorkspaces.sourceIssueId,
+            mode: executionWorkspaces.mode,
+            strategyType: executionWorkspaces.strategyType,
+            name: executionWorkspaces.name,
+            status: executionWorkspaces.status,
+            cwd: executionWorkspaces.cwd,
+            repoUrl: executionWorkspaces.repoUrl,
+            baseRef: executionWorkspaces.baseRef,
+            branchName: executionWorkspaces.branchName,
+            providerType: executionWorkspaces.providerType,
+            providerRef: executionWorkspaces.providerRef,
+            derivedFromExecutionWorkspaceId: executionWorkspaces.derivedFromExecutionWorkspaceId,
+            lastUsedAt: executionWorkspaces.lastUsedAt,
+            openedAt: executionWorkspaces.openedAt,
+            closedAt: executionWorkspaces.closedAt,
+            cleanupEligibleAt: executionWorkspaces.cleanupEligibleAt,
+            cleanupReason: executionWorkspaces.cleanupReason,
+            metadata: executionWorkspaces.metadata,
+            createdAt: executionWorkspaces.createdAt,
+            updatedAt: executionWorkspaces.updatedAt,
+            projectName: projects.name,
+            projectWorkspaceMetadata: projectWorkspaces.metadata,
+          })
+          .from(executionWorkspaces)
+          .innerJoin(
+            projects,
+            and(
+              eq(projects.id, executionWorkspaces.projectId),
+              eq(projects.companyId, companyId),
+            ),
+          )
+          .leftJoin(
+            projectWorkspaces,
+            and(
+              eq(projectWorkspaces.id, executionWorkspaces.projectWorkspaceId),
+              eq(projectWorkspaces.companyId, companyId),
+            ),
+          )
+          .where(whereClause)
+          .orderBy(
+            desc(executionWorkspaces.lastUsedAt),
+            desc(executionWorkspaces.updatedAt),
+            asc(executionWorkspaces.id),
+          )
+          .limit(filters.limit)
+          .offset(filters.offset),
+      ]);
+
+      const pageRows = rows as WorkspaceOverviewPageRow[];
+      if (pageRows.length === 0) {
+        return {
+          items: [],
+          total: totalRow.count,
+          limit: filters.limit,
+          offset: filters.offset,
+          hasMore: false,
+          nextOffset: null,
+        };
+      }
+
+      const workspaceIds = pageRows.map((row) => row.id);
+      const [runtimeServicesByWorkspaceId, linkedIssueCountRows, linkedIssueRows] = await Promise.all([
+        loadEffectiveRuntimeServicesByExecutionWorkspace(db, companyId, pageRows),
+        db
+          .select({
+            executionWorkspaceId: issues.executionWorkspaceId,
+            count: sql<number>`count(*)::int`,
+          })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, companyId),
+              isNull(issues.hiddenAt),
+              inArray(issues.executionWorkspaceId, workspaceIds),
+            ),
+          )
+          .groupBy(issues.executionWorkspaceId),
+        db.execute(sql`
+          select
+            ranked.execution_workspace_id as "executionWorkspaceId",
+            ranked.id,
+            ranked.identifier,
+            ranked.title,
+            ranked.status,
+            ranked.priority,
+            ranked.updated_at as "updatedAt"
+          from (
+            select
+              ${issues.executionWorkspaceId} as execution_workspace_id,
+              ${issues.id} as id,
+              ${issues.identifier} as identifier,
+              ${issues.title} as title,
+              ${issues.status} as status,
+              ${issues.priority} as priority,
+              ${issues.updatedAt} as updated_at,
+              row_number() over (
+                partition by ${issues.executionWorkspaceId}
+                order by ${issues.updatedAt} desc, ${issues.id} asc
+              ) as row_number
+            from ${issues}
+            where ${issues.companyId} = ${companyId}
+              and ${issues.hiddenAt} is null
+              and ${issues.executionWorkspaceId} in (${sql.join(workspaceIds.map((id) => sql`${id}`), sql`, `)})
+          ) ranked
+          where ranked.row_number <= ${WORKSPACE_OVERVIEW_LINKED_ISSUE_LIMIT}
+          order by ranked.execution_workspace_id asc, ranked.row_number asc
+        `),
+      ]);
+
+      const linkedIssueCountByWorkspaceId = new Map(
+        linkedIssueCountRows
+          .filter((row) => row.executionWorkspaceId)
+          .map((row) => [row.executionWorkspaceId!, row.count]),
+      );
+      const linkedIssuesByWorkspaceId = new Map<string, WorkspaceOverviewLinkedIssue[]>();
+      for (const issue of linkedIssueRows as unknown as WorkspaceOverviewIssueRow[]) {
+        const existing = linkedIssuesByWorkspaceId.get(issue.executionWorkspaceId) ?? [];
+        existing.push({
+          id: issue.id,
+          identifier: issue.identifier,
+          title: issue.title,
+          status: issue.status,
+          priority: issue.priority,
+          updatedAt: issue.updatedAt,
+        });
+        linkedIssuesByWorkspaceId.set(issue.executionWorkspaceId, existing);
+      }
+
+      const items: WorkspaceOverviewItem[] = pageRows.map((row) => {
+        const runtimeServices = (runtimeServicesByWorkspaceId.get(row.id) ?? []).map(toRuntimeService);
+        const runningServiceCount = runtimeServices.filter((service) => service.status === "running").length;
+        const primaryService = selectPrimaryOverviewService(runtimeServices);
+        const config = readExecutionWorkspaceConfig((row.metadata as Record<string, unknown> | null) ?? null);
+        const inheritedProjectRuntimeConfig = usesInheritedProjectRuntimeServices(row)
+          ? readProjectWorkspaceRuntimeConfig(row.projectWorkspaceMetadata)
+          : null;
+        const linkedIssues = linkedIssuesByWorkspaceId.get(row.id) ?? [];
+        const primaryServiceSummary = toWorkspaceOverviewPrimaryService(primaryService);
+
+        return {
+          key: `execution:${row.id}`,
+          kind: "execution_workspace",
+          workspaceId: row.id,
+          workspaceName: row.name,
+          projectId: row.projectId,
+          projectUrlKey: deriveProjectUrlKey(row.projectName, row.projectId),
+          projectName: row.projectName,
+          mode: row.mode as WorkspaceOverviewItem["mode"],
+          strategyType: row.strategyType as WorkspaceOverviewItem["strategyType"],
+          cwd: row.cwd ?? null,
+          branchName: row.branchName ?? row.baseRef ?? null,
+          lastUpdatedAt: maxDate(
+            row.lastUsedAt,
+            row.updatedAt,
+            linkedIssues[0]?.updatedAt,
+            primaryServiceSummary?.updatedAt,
+          ),
+          projectWorkspaceId: row.projectWorkspaceId ?? null,
+          executionWorkspaceId: row.id,
+          executionWorkspaceStatus: row.status as WorkspaceOverviewItem["executionWorkspaceStatus"],
+          serviceCount: runtimeServices.length,
+          runningServiceCount,
+          primaryServiceUrl: primaryService?.url ?? null,
+          primaryServiceUrlRunning: primaryService?.status === "running",
+          primaryService: primaryServiceSummary,
+          hasRuntimeConfig: Boolean(config?.workspaceRuntime ?? inheritedProjectRuntimeConfig?.workspaceRuntime),
+          linkedIssueCount: linkedIssueCountByWorkspaceId.get(row.id) ?? 0,
+          linkedIssues,
+        };
+      });
+
+      const nextOffset = filters.offset + items.length;
+      const total = totalRow.count;
+      return {
+        items,
+        total,
+        limit: filters.limit,
+        offset: filters.offset,
+        hasMore: nextOffset < total,
+        nextOffset: nextOffset < total ? nextOffset : null,
+      };
+    },
+
     list: async (companyId: string, filters?: {
       projectId?: string;
       projectWorkspaceId?: string;
@@ -326,27 +702,44 @@ export function executionWorkspaceService(db: Db) {
       status?: string;
       reuseEligible?: boolean;
     }) => {
-      const conditions = [eq(executionWorkspaces.companyId, companyId)];
-      if (filters?.projectId) conditions.push(eq(executionWorkspaces.projectId, filters.projectId));
-      if (filters?.projectWorkspaceId) {
-        conditions.push(eq(executionWorkspaces.projectWorkspaceId, filters.projectWorkspaceId));
-      }
-      if (filters?.issueId) conditions.push(eq(executionWorkspaces.sourceIssueId, filters.issueId));
-      if (filters?.status) {
-        const statuses = filters.status.split(",").map((value) => value.trim()).filter(Boolean);
-        if (statuses.length === 1) conditions.push(eq(executionWorkspaces.status, statuses[0]!));
-        else if (statuses.length > 1) conditions.push(inArray(executionWorkspaces.status, statuses));
-      }
-      if (filters?.reuseEligible) {
-        conditions.push(inArray(executionWorkspaces.status, ["active", "idle", "in_review"]));
-      }
-
+      const conditions = buildListConditions(companyId, filters);
       const rows = await db
         .select()
         .from(executionWorkspaces)
         .where(and(...conditions))
         .orderBy(desc(executionWorkspaces.lastUsedAt), desc(executionWorkspaces.createdAt));
-      return rows.map((row) => toExecutionWorkspace(row));
+      const runtimeServicesByWorkspaceId = await loadEffectiveRuntimeServicesByExecutionWorkspace(db, companyId, rows);
+      return rows.map((row) =>
+        toExecutionWorkspace(
+          row,
+          (runtimeServicesByWorkspaceId.get(row.id) ?? []).map(toRuntimeService),
+        ),
+      );
+    },
+
+    listSummaries: async (companyId: string, filters?: {
+      projectId?: string;
+      projectWorkspaceId?: string;
+      issueId?: string;
+      status?: string;
+      reuseEligible?: boolean;
+    }) => {
+      const conditions = buildListConditions(companyId, filters);
+      const rows = await db
+        .select({
+          id: executionWorkspaces.id,
+          name: executionWorkspaces.name,
+          mode: executionWorkspaces.mode,
+          status: executionWorkspaces.status,
+          cwd: executionWorkspaces.cwd,
+          branchName: executionWorkspaces.branchName,
+          projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
+          lastUsedAt: executionWorkspaces.lastUsedAt,
+        })
+        .from(executionWorkspaces)
+        .where(and(...conditions))
+        .orderBy(desc(executionWorkspaces.lastUsedAt), desc(executionWorkspaces.createdAt));
+      return rows.map((row) => toExecutionWorkspaceSummary(row));
     },
 
     getById: async (id: string) => {
@@ -356,12 +749,11 @@ export function executionWorkspaceService(db: Db) {
         .where(eq(executionWorkspaces.id, id))
         .then((rows) => rows[0] ?? null);
       if (!row) return null;
-      const runtimeServiceRows = await db
-        .select()
-        .from(workspaceRuntimeServices)
-        .where(eq(workspaceRuntimeServices.executionWorkspaceId, row.id))
-        .orderBy(desc(workspaceRuntimeServices.updatedAt), desc(workspaceRuntimeServices.createdAt));
-      return toExecutionWorkspace(row, runtimeServiceRows.map(toRuntimeService));
+      const runtimeServicesByWorkspaceId = await loadEffectiveRuntimeServicesByExecutionWorkspace(db, row.companyId, [row]);
+      return toExecutionWorkspace(
+        row,
+        (runtimeServicesByWorkspaceId.get(row.id) ?? []).map(toRuntimeService),
+      );
     },
 
     getCloseReadiness: async (id: string): Promise<ExecutionWorkspaceCloseReadiness | null> => {
@@ -372,12 +764,8 @@ export function executionWorkspaceService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!workspace) return null;
 
-      const runtimeServiceRows = await db
-        .select()
-        .from(workspaceRuntimeServices)
-        .where(eq(workspaceRuntimeServices.executionWorkspaceId, workspace.id))
-        .orderBy(desc(workspaceRuntimeServices.updatedAt), desc(workspaceRuntimeServices.createdAt));
-      const runtimeServices = runtimeServiceRows.map(toRuntimeService);
+      const runtimeServicesByWorkspaceId = await loadEffectiveRuntimeServicesByExecutionWorkspace(db, workspace.companyId, [workspace]);
+      const runtimeServices = (runtimeServicesByWorkspaceId.get(workspace.id) ?? []).map(toRuntimeService);
 
       const linkedIssues = await db
         .select({
@@ -636,6 +1024,37 @@ export function executionWorkspaceService(db: Db) {
         .returning()
         .then((rows) => rows[0] ?? null);
       return row ? toExecutionWorkspace(row) : null;
+    },
+
+    clearEnvironmentSelection: async (companyId: string, environmentId: string) => {
+      return db.transaction(async (tx) => {
+        const rows = await tx
+          .select({
+            id: executionWorkspaces.id,
+            metadata: executionWorkspaces.metadata,
+          })
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.companyId, companyId));
+
+        let cleared = 0;
+        const updatedAt = new Date();
+        for (const row of rows) {
+          const metadata = (row.metadata as Record<string, unknown> | null) ?? null;
+          const config = readExecutionWorkspaceConfig(metadata);
+          if (config?.environmentId !== environmentId) continue;
+
+          await tx
+            .update(executionWorkspaces)
+            .set({
+              metadata: mergeExecutionWorkspaceConfig(metadata, { environmentId: null }),
+              updatedAt,
+            })
+            .where(eq(executionWorkspaces.id, row.id));
+          cleared += 1;
+        }
+
+        return cleared;
+      });
     },
   };
 }
